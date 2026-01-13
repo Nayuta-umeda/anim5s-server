@@ -1,4 +1,4 @@
-// anim5s Phase2 server (Node.js + ws) - improved keepalive
+// anim5s Phase2 server (Node.js + ws) + log_stroke
 // - /health : ok
 // - ws: /ws
 // 永続化なし（メモリ）。Phase3でDB等へ。
@@ -14,6 +14,10 @@ const UPLOAD_TTL_MS = 5_000;
 const MAX_BYTES = 512_000; // 256x256 PNG想定
 const HOUSEKEEP_MS = 10_000;
 const PING_MS = 25_000;
+
+// ログ上限（メモリ保護）
+const LOG_MAX_STROKES_PER_FRAME = 300;
+const LOG_MAX_POINTS_PER_STROKE = 600;
 
 function now() { return Date.now(); }
 function sha256(s) {
@@ -55,6 +59,7 @@ function makeRoom({roomId, visibility, theme, passphrase}) {
     filled: Array.from({length: FRAME_COUNT}, () => false),
     reservations: new Map(), // frameIndex -> {wsId, token, expiresAt}
     clients: new Set(), // ws
+    logs: Array.from({length: FRAME_COUNT}, () => []), // stroke logs（内部）
   };
 }
 
@@ -118,7 +123,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, {"content-type":"text/plain; charset=utf-8"});
-  res.end("anim5s Phase2 server\n/health ok\n/ws websocket\n");
+  res.end("anim5s server\n/health ok\n/ws websocket\n");
 });
 
 const wss = new WebSocketServer({ noServer: true });
@@ -151,11 +156,7 @@ function sendRoomState(ws, room, extra={}) {
 }
 
 async function sendRoomAll(ws, room) {
-  const info = ws.joinInfo?.get(room.roomId);
-  const extra = {};
-  if (info?.reservationExpiresAt) extra.reservationExpiresAt = info.reservationExpiresAt;
-  sendRoomState(ws, room, extra);
-
+  sendRoomState(ws, room);
   for (let i=0;i<FRAME_COUNT;i++){
     const buf = room.frames[i];
     if (!buf) continue;
@@ -180,10 +181,7 @@ function leaveSocket(ws) {
 
 function broadcastRoomState(room) {
   for (const c of room.clients) {
-    const info = c.joinInfo?.get(room.roomId);
-    const extra = {};
-    if (info?.reservationExpiresAt) extra.reservationExpiresAt = info.reservationExpiresAt;
-    sendRoomState(c, room, extra);
+    sendRoomState(c, room);
   }
 }
 
@@ -191,10 +189,10 @@ wss.on("connection", (ws) => {
   const wsId = "ws" + (++wsCounter);
   ws.wsId = wsId;
   ws.rooms = new Set();
-  ws.joinInfo = new Map(); // roomId -> {canEdit, assignedFrame, reservationToken, reservationExpiresAt, flow, pass}
+  ws.joinInfo = new Map(); // roomId -> {canEdit, assignedFrame, reservationToken, flow, pass}
   ws.pendingUpload = null; // {roomId, frameIndex, mime, ts}
 
-  // keepalive (ping frame)
+  // keepalive（ws ping/pong）
   ws.isAlive = true;
   ws.on("pong", ()=>{ ws.isAlive = true; });
 
@@ -208,6 +206,7 @@ wss.on("connection", (ws) => {
         const p = ws.pendingUpload;
         ws.pendingUpload = null;
         if (!p) return;
+
         if (!(data instanceof Buffer)) data = Buffer.from(data);
         if (data.length > MAX_BYTES) { sendError(ws, "サイズ大きい", "TOO_BIG"); return; }
 
@@ -218,7 +217,7 @@ wss.on("connection", (ws) => {
 
         const info = ws.joinInfo.get(p.roomId);
         if (!info) { sendError(ws, "入ってない"); return; }
-        if (info.canEdit === "view") { sendError(ws, "見てるだけ"); return; }
+        if (info.canEdit === "view") { sendError(ws, "見るだけ"); return; }
 
         if (info.canEdit === "assigned") {
           if (info.assignedFrame !== p.frameIndex) { sendError(ws, "そのコマじゃない"); return; }
@@ -269,7 +268,6 @@ wss.on("connection", (ws) => {
           canEdit: "assigned",
           assignedFrame,
           reservationToken: token,
-          reservationExpiresAt: expiresAt,
           flow: "create",
           pass: visibility==="private" ? passphrase : null,
         };
@@ -314,7 +312,6 @@ wss.on("connection", (ws) => {
           canEdit: "assigned",
           assignedFrame: frameIndex,
           reservationToken: token,
-          reservationExpiresAt: expiresAt,
           flow: "random",
           pass: null,
         };
@@ -345,14 +342,7 @@ wss.on("connection", (ws) => {
         if (!passphrase) { sendError(ws, "合言葉", "NEED_PASS"); return; }
         if (sha256(passphrase) !== room.passHash) { sendError(ws, "合言葉ちがう", "BAD_PASS"); return; }
 
-        const joinInfo = {
-          canEdit: "any",
-          assignedFrame: null,
-          reservationToken: null,
-          reservationExpiresAt: null,
-          flow: "private",
-          pass: passphrase,
-        };
+        const joinInfo = { canEdit: "any", assignedFrame:null, reservationToken:null, flow:"private", pass: passphrase };
         joinRoomSocket(ws, room, joinInfo);
 
         send(ws, {
@@ -381,14 +371,7 @@ wss.on("connection", (ws) => {
           if (sha256(passphrase) !== room.passHash) { sendError(ws, "合言葉ちがう", "BAD_PASS"); return; }
         }
 
-        const joinInfo = {
-          canEdit: "view",
-          assignedFrame: null,
-          reservationToken: null,
-          reservationExpiresAt: null,
-          flow: "view",
-          pass: null,
-        };
+        const joinInfo = { canEdit:"view", assignedFrame:null, reservationToken:null, flow:"view", pass:null };
         joinRoomSocket(ws, room, joinInfo);
 
         send(ws, {
@@ -413,6 +396,44 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      // ログ（内部保存。配信しない。）
+      if (msg.t === "log_stroke") {
+        const roomId = String(msg.roomId || "").trim().toUpperCase();
+        const frameIndex = Number(msg.frameIndex);
+        const room = rooms.get(roomId);
+        if (!room) return;
+        if (!Number.isFinite(frameIndex) || frameIndex < 0 || frameIndex >= FRAME_COUNT) return;
+
+        const info = ws.joinInfo.get(roomId);
+        if (!info) return;
+        if (info.canEdit === "view") return;
+        if (info.canEdit === "assigned" && info.assignedFrame !== frameIndex) return;
+
+        const pts = Array.isArray(msg.pts) ? msg.pts : [];
+        const clipped = pts.slice(0, LOG_MAX_POINTS_PER_STROKE).map(p=>{
+          const x = Number(p?.[0]); const y = Number(p?.[1]);
+          if(!Number.isFinite(x) || !Number.isFinite(y)) return null;
+          return [Math.max(0,Math.min(255, x|0)), Math.max(0,Math.min(255, y|0))];
+        }).filter(Boolean);
+
+        if (!clipped.length) return;
+
+        const stroke = {
+          ts: Number(msg.ts || now()),
+          tool: String(msg.tool || "pen"),
+          color: String(msg.color || "#000000").slice(0, 16),
+          size: Math.max(1, Math.min(60, Number(msg.size || 6))),
+          pts: clipped,
+          wsId: ws.wsId,
+        };
+
+        const arr = room.logs[frameIndex];
+        arr.push(stroke);
+        if (arr.length > LOG_MAX_STROKES_PER_FRAME) arr.splice(0, arr.length - LOG_MAX_STROKES_PER_FRAME);
+        room.updatedAt = now();
+        return;
+      }
+
       if (msg.t === "submit_begin") {
         const roomId = String(msg.roomId || "").trim().toUpperCase();
         const frameIndex = Number(msg.frameIndex);
@@ -426,7 +447,7 @@ wss.on("connection", (ws) => {
 
         const info = ws.joinInfo.get(roomId);
         if (!info) { sendError(ws, "入ってない", "NOT_JOINED"); return; }
-        if (info.canEdit === "view") { sendError(ws, "見てるだけ", "VIEW_ONLY"); return; }
+        if (info.canEdit === "view") { sendError(ws, "見るだけ", "VIEW_ONLY"); return; }
 
         if (info.canEdit === "assigned") {
           const tok = String(msg.reservationToken || "");
@@ -457,7 +478,7 @@ wss.on("connection", (ws) => {
 // housekeep
 setInterval(() => cleanupReservations(rooms), HOUSEKEEP_MS);
 
-// ping frame keepalive
+// ping keepalive
 setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.isAlive === false) {
@@ -470,5 +491,5 @@ setInterval(() => {
 }, PING_MS);
 
 server.listen(PORT, () => {
-  console.log("anim5s Phase2 server on", PORT);
+  console.log("anim5s server on", PORT);
 });

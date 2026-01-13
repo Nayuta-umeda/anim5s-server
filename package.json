@@ -1,9 +1,8 @@
 {
-  "name": "anim-5s-ws-server",
+  "name": "anim5s-phase2-server",
   "version": "1.0.0",
+  "type": "module",
   "private": true,
-  "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },

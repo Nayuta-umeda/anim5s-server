@@ -1,7 +1,7 @@
 {
   "name": "anim5s-server",
-  "version": "1.0.0",
   "private": true,
+  "type": "commonjs",
   "main": "server.cjs",
   "scripts": {
     "start": "node server.cjs"
@@ -11,6 +11,5 @@
   },
   "engines": {
     "node": ">=18"
-  },
-  "type": "commonjs"
+  }
 }

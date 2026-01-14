@@ -1,47 +1,28 @@
-# 共同5秒アニメ（1人1フレーム）V12 ZIP
+# anim5s (spec 2026-01-15)
 
-## 構成
-- /client: GitHub Pages 等で配信する静的ファイル
-- /server: Node.js + ws の WebSocket サーバ（Render 等で稼働想定）
+## 確定仕様
+部屋は3つ：
+- テーマを作成（公開: 1コマ目 / プライベート: ローカルのみ）
+- テーマに参加（公開ランダム参加）
+- 自分の作品（公開の追跡 + ローカルプライベート編集）
 
-## V12 追加点（重要）
-- デバッグログを localStorage に保存（キー: `anim5s_debug_log_v12`, 最大1200件）
-- 右下「LOG」ボタンでログ表示、絞り込み、コピー、消去
-- WebSocket をラップして送受信ログを自動記録（ws_ctor/open/send/recv/close/error）
-- `wsUrlFromBase()` を強化（/ws 二重付加防止、ws/wss/プロトコル無しも許容）
+重要：
+- 公開「テーマを作成」は **1コマ目を提出した瞬間にだけ** サーバ上に部屋が生成されます（提出まで他人に反映されません / A案）。
+- プライベート作品は **ローカル保存のみ**（サーバに送信しません）。
+- 「テーマに参加」は **予約トークン方式**（期限あり / 提出時に検証）。
 
-## 使い方（ざっくり）
-1) `client/config.js` の `DEFAULT_SERVER_BASE` をあなたのWSサーバURL（httpsのbase）にする  
-2) /server を起動（後述）  
-3) /client を静的ホスティング（GitHub Pages等）  
-4) `ws-test.html` で `wss://.../ws` が OPEN するか確認
+## フォルダ
+- `client/` : GitHub Pages 等に置く静的ファイル
+- `server/` : Render 等で動かす WebSocket サーバ（/ws）
 
-## サーバ起動（ローカル）
-```bash
-cd server
-npm i ws
-node server.js
-```
-既定で `http://localhost:3000` が base になります（WSは `ws://localhost:3000/ws`）。
+## Render（Web Service）でサーバを動かす
+1. Renderで新しいWeb Serviceを作成（GitHubリポジトリを選択）
+2. Root Directory を `server` に設定
+3. Start Command は `npm start`（package.jsonに定義済み）
+4. デプロイ後、URL（例：https://xxxx.onrender.com）を `client/config.js` の `DEFAULT_SERVER_BASE` に設定
 
-## 注意
-- https 上のページからは必ず wss が必要です
-- 「お題：-」のまま → join 成功応答が来てない可能性が高いです。LOGで `ws_open -> ws_send(join_*) -> ws_recv(room_state)` を見てください。
+## GitHub Pages
+`client/` を公開対象にしてください（docs/運用でもOK）。
 
-
-## UI変更（2026-01-14）
-- 白背景 + 淡い配色（ライトテーマ）
-- 編集画面はスクロール無しの1画面（上: お題/部屋ID/担当コマ、中央: 256x256、下: タブ）
-- タブは「描く」「見る」
-- 手を離すたびに内部更新（下書き保存）。提出は送信 or 3分タイムアウト。
-- コマ表記は 1〜60。
-
-
-## Render用メモ
-- Renderにデプロイする場合は `server/package.json` が必要です。
-- Renderの Web Service 設定で Root Directory を `server` にし、Start Command は `npm start` が無難です。
-
-
-## Renderデプロイ注意（Node 22 / ESM対策）
-- RenderがESM扱いで起動して `require is not defined` になる場合があるため、serverは `server.cjs` (CommonJS) で起動するようにしています。
-- RenderのWeb Serviceは Root Directory を `server` にして、Start Command は `npm start` にしてください。
+## 接続確認
+`client/ws-test.html` を開いて OPEN/RECV が出るか確認。

@@ -129,11 +129,14 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  if (!req.url || !req.url.startsWith("/ws")) {
+  const u = req.url || "";
+  if (!u.startsWith("/ws")) {
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
 });
 
 function send(ws, obj) {

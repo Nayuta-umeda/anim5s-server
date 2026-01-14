@@ -35,3 +35,13 @@ node server.js
 - タブは「描く」「見る」
 - 手を離すたびに内部更新（下書き保存）。提出は送信 or 3分タイムアウト。
 - コマ表記は 1〜60。
+
+
+## Render用メモ
+- Renderにデプロイする場合は `server/package.json` が必要です。
+- Renderの Web Service 設定で Root Directory を `server` にし、Start Command は `npm start` が無難です。
+
+
+## Renderデプロイ注意（Node 22 / ESM対策）
+- RenderがESM扱いで起動して `require is not defined` になる場合があるため、serverは `server.cjs` (CommonJS) で起動するようにしています。
+- RenderのWeb Serviceは Root Directory を `server` にして、Start Command は `npm start` にしてください。

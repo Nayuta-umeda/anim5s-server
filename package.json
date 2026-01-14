@@ -1,12 +1,16 @@
 {
-  "name": "anim5s-phase2-server",
-  "version": "1.2.0",
-  "type": "module",
+  "name": "anim5s-server",
+  "version": "1.0.0",
   "private": true,
+  "main": "server.cjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.cjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
-  }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "type": "commonjs"
 }

@@ -1,576 +1,288 @@
-// anim5s Phase2 server (Node.js + ws) + log_stroke
-// - /health : ok
-// - ws: /ws
-// 永続化なし（メモリ）。Phase3でDB等へ。
+/**
+ * anim5s server (V12 debug-friendly)
+ * - Node.js + ws
+ * - WebSocket endpoint: /ws
+ * - Minimal room management for "1人1フレーム" 60 frames
+ */
+const http = require("http");
+const WebSocket = require("ws");
 
-import http from "http";
-import crypto from "crypto";
-import { WebSocketServer } from "ws";
+const PORT = process.env.PORT || 3000;
 
-const PORT = Number(process.env.PORT || 8080);
-const FRAME_COUNT = 60;
-const RESERVE_MS = 90_000;
-const UPLOAD_TTL_MS = 5_000;
-const MAX_BYTES = 512_000; // 256x256 PNG想定
-const HOUSEKEEP_MS = 10_000;
-const PING_MS = 25_000;
+const THEMES = [
+  "歩く犬",
+  "通勤時間",
+  "空を飛ぶ紙飛行機",
+  "逃げるおにぎり",
+  "笑う信号機",
+  "変身する靴下",
+  "増えるコーヒー",
+  "踊る影",
+];
 
-// ログ上限（メモリ保護）
-const LOG_MAX_STROKES_PER_FRAME = 300;
-const LOG_MAX_POINTS_PER_STROKE = 600;
-
-function now() { return Date.now(); }
-function sha256(s) {
-  return crypto.createHash("sha256").update(String(s)).digest("hex");
-}
-function randId(len=7) {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let out = "";
-  for (let i=0;i<len;i++) out += chars[(Math.random()*chars.length)|0];
-  return out;
-}
-function genRoomId(rooms) {
-  for (let i=0;i<30;i++){
-    const id = randId(7);
-    if (!rooms.has(id)) return id;
-  }
-  return randId(10);
-}
-function genToken() {
-  return crypto.randomBytes(9).toString("base64url");
-}
-function safeTheme(s) {
-  const t = String(s || "").trim();
-  if (!t) return "";
-  return t.slice(0, 60);
+function randTheme() {
+  return THEMES[Math.floor(Math.random() * THEMES.length)];
 }
 
-function makeRoom({roomId, visibility, theme, passphrase}) {
-  const t = now();
+function id7() {
+  // 7 chars base36
+  return Math.random().toString(36).slice(2, 9).toUpperCase();
+}
+
+function nowTs() { return Date.now(); }
+
+const rooms = new Map(); // roomId -> room
+// room: { roomId, theme, password, frameCount, fps, phase, revision, frames[], assignments: Map(clientId->frameIndex), clients:Set(ws) }
+
+function roomState(room, clientId) {
+  const assignedFrame = room.assignments.get(clientId);
   return {
-    roomId,
-    visibility, // public/private
-    theme,
-    passHash: visibility==="private" ? sha256(passphrase || "") : null,
-    createdAt: t,
-    updatedAt: t,
-    completed: false,
-    frames: Array.from({length: FRAME_COUNT}, () => null), // Buffer or null
-    filled: Array.from({length: FRAME_COUNT}, () => false),
-    reservations: new Map(), // frameIndex -> {wsId, token, expiresAt}
-    clients: new Set(), // ws
-    logs: Array.from({length: FRAME_COUNT}, () => []), // stroke logs（内部）
+    roomId: room.roomId,
+    phase: room.phase,
+    theme: room.theme,
+    revision: room.revision,
+    frameCount: room.frameCount,
+    fps: room.fps,
+    assignedFrame: (typeof assignedFrame === "number") ? assignedFrame : -1,
+    frames: room.frames.map(f => f && f.dataUrl ? f.dataUrl : null),
+    policy: {
+      maxW: 256, maxH: 256, maxBytes: 1_500_000,
+      submit: "button_or_timeout"
+    }
   };
 }
 
-function reserveFrame(room, frameIndex, wsId) {
-  const token = genToken();
-  const expiresAt = now() + RESERVE_MS;
-  room.reservations.set(frameIndex, { wsId, token, expiresAt });
-  return { token, expiresAt };
-}
-
-function releaseReservation(room, frameIndex, wsId) {
-  const r = room.reservations.get(frameIndex);
-  if (!r) return;
-  if (wsId && r.wsId !== wsId) return;
-  room.reservations.delete(frameIndex);
-}
-
-function cleanupReservations(rooms) {
-  const t = now();
-  for (const room of rooms.values()) {
-    for (const [k, r] of room.reservations.entries()) {
-      if (r.expiresAt <= t) {
-        if (!room.filled[k]) room.reservations.delete(k);
-      }
-    }
+function broadcast(room, msgObj) {
+  const text = JSON.stringify(msgObj);
+  for (const ws of room.clients) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(text);
   }
 }
 
-function earliestEmptyFrame(room) {
-  for (let i=0;i<FRAME_COUNT;i++){
-    if (room.filled[i]) continue;
-    if (room.reservations.has(i)) continue;
-    return i;
+function send(ws, obj) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function makeRoom({ theme, password }) {
+  const roomId = id7();
+  const room = {
+    roomId,
+    theme: theme && String(theme).trim() ? String(theme).trim() : randTheme(),
+    password: password ? String(password) : "",
+    frameCount: 60,
+    fps: 12,
+    phase: "DRAWING",
+    revision: 1,
+    frames: Array.from({ length: 60 }, () => ({ committed: false, dataUrl: null, author: null, ts: null })),
+    assignments: new Map(),
+    clients: new Set(),
+  };
+  rooms.set(roomId, room);
+  return room;
+}
+
+function countCommitted(room) {
+  let n = 0;
+  for (const f of room.frames) if (f.committed) n++;
+  return n;
+}
+
+function firstEmptyFrame(room) {
+  for (let i = 0; i < room.frameCount; i++) {
+    if (!room.frames[i].committed && ![...room.assignments.values()].includes(i)) return i;
+  }
+  // if all uncommitted are assigned, still allow joining but assign first uncommitted
+  for (let i = 0; i < room.frameCount; i++) {
+    if (!room.frames[i].committed) return i;
   }
   return -1;
 }
 
-function eligiblePublicRooms(rooms) {
-  const arr = [];
+function findRandomOpenRoom() {
+  const candidates = [];
   for (const room of rooms.values()) {
-    if (room.visibility !== "public") continue;
-    if (room.completed) continue;
-    if (earliestEmptyFrame(room) === -1) continue;
-    arr.push(room);
+    if (room.phase !== "DRAWING") continue;
+    if (countCommitted(room) >= room.frameCount) continue;
+    candidates.push(room);
   }
-  return arr;
+  if (!candidates.length) return null;
+  return candidates[Math.floor(Math.random() * candidates.length)];
 }
 
-function pickRandom(arr) {
-  return arr[(Math.random()*arr.length)|0];
-}
-
-const rooms = new Map(); // roomId -> room
-let wsCounter = 0;
-
-const server = http.createServer((req, res) => {
-  if (!req.url) { res.writeHead(404); res.end(); return; }
-  if (req.url.startsWith("/health")) {
-    res.writeHead(200, {"content-type":"application/json; charset=utf-8"});
-    res.end(JSON.stringify({ ok:true, ts: now(), rooms: rooms.size }));
+function joinRoom(ws, clientId, room, password) {
+  if (room.password && room.password !== (password || "")) {
+    send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"合言葉が違う" } });
     return;
   }
-  res.writeHead(200, {"content-type":"text/plain; charset=utf-8"});
-  res.end("anim5s server\n/health ok\n/ws websocket\n");
+  room.clients.add(ws);
+  if (!room.assignments.has(clientId)) {
+    const idx = firstEmptyFrame(room);
+    if (idx >= 0) room.assignments.set(clientId, idx);
+  }
+  send(ws, { v:1, t:"joined", ts: nowTs(), data: roomState(room, clientId) });
+}
+
+function forkPrivate(ws, clientId, srcRoom, password) {
+  const room = makeRoom({ theme: srcRoom.theme, password });
+  // copy frames
+  room.frames = srcRoom.frames.map(f => ({ ...f }));
+  room.revision = srcRoom.revision + 1;
+  // join
+  joinRoom(ws, clientId, room, password);
+  send(ws, { v:1, t:"forked", ts: nowTs(), data:{ roomId: room.roomId, theme: room.theme, password: room.password } });
+}
+
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, rooms: rooms.size, ts: nowTs() }));
+    return;
+  }
+  res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+  res.end("anim5s server up. WebSocket: /ws\n");
 });
 
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   if (!req.url || !req.url.startsWith("/ws")) {
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
 });
 
-function send(ws, obj) {
-  try { ws.send(JSON.stringify(obj)); } catch {}
-}
-function sendError(ws, message, code="ERR") {
-  send(ws, { t:"error", code, message });
-}
-function sendRoomState(ws, room, extra={}) {
-  send(ws, {
-    t:"room_state",
-    roomId: room.roomId,
-    theme: room.theme,
-    visibility: room.visibility,
-    filled: room.filled,
-    updatedAt: room.updatedAt,
-    completed: room.completed,
-    ...extra,
-  });
-}
-
-async function sendRoomAll(ws, room) {
-  sendRoomState(ws, room);
-  for (let i=0;i<FRAME_COUNT;i++){
-    const buf = room.frames[i];
-    if (!buf) continue;
-    send(ws, { t:"frame_update_begin", roomId: room.roomId, frameIndex: i, mime: "image/png" });
-    try { ws.send(buf); } catch {}
-  }
-}
-
-function joinRoomSocket(ws, room, joinInfo) {
-  room.clients.add(ws);
-  ws.joinInfo.set(room.roomId, joinInfo);
-  ws.rooms.add(room.roomId);
-}
-
-function leaveSocket(ws) {
-  for (const roomId of ws.rooms) {
-    const room = rooms.get(roomId);
-    if (!room) continue;
-    room.clients.delete(ws);
-  }
-}
-
-function broadcastRoomState(room) {
-  for (const c of room.clients) {
-    sendRoomState(c, room);
-  }
-}
+let clientSeq = 1;
 
 wss.on("connection", (ws) => {
-  const wsId = "ws" + (++wsCounter);
-  ws.wsId = wsId;
-  ws.rooms = new Set();
-  ws.joinInfo = new Map(); // roomId -> {canEdit, assignedFrame, reservationToken, flow, pass}
-  ws.pendingUpload = null; // {roomId, frameIndex, mime, ts}
+  const clientId = "c" + (clientSeq++);
+  ws._clientId = clientId;
+  ws._roomId = null;
 
-  // keepalive（ws ping/pong）
-  ws.isAlive = true;
-  ws.on("pong", ()=>{ ws.isAlive = true; });
+  send(ws, { v:1, t:"welcome", ts: nowTs(), data:{ clientId, serverTime: nowTs() } });
 
-  send(ws, { t:"welcome", wsId });
+  ws.on("message", (data) => {
+    let msg = null;
+    try { msg = JSON.parse(String(data)); } catch (e) {
+      send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"JSON parse error" } });
+      return;
+    }
+    const t = msg.t;
+    const d = msg.data || {};
+    const rid = d.roomId || msg.roomId || ws._roomId;
 
-  ws.on("close", () => leaveSocket(ws));
+    if (t === "hello") {
+      return; // already welcomed
+    }
 
-  ws.on("message", async (data, isBinary) => {
-    try {
-      if (isBinary) {
-        const p = ws.pendingUpload;
-        ws.pendingUpload = null;
-        if (!p) return;
+    if (t === "create_room") {
+      const room = makeRoom({ theme: d.theme });
+      ws._roomId = room.roomId;
+      joinRoom(ws, clientId, room, room.password);
+      send(ws, { v:1, t:"created", ts: nowTs(), data:{ roomId: room.roomId, theme: room.theme, password: room.password } });
+      return;
+    }
 
-        if (!(data instanceof Buffer)) data = Buffer.from(data);
-        if (data.length > MAX_BYTES) { sendError(ws, "サイズ大きい", "TOO_BIG"); return; }
+    if (t === "join_random") {
+      let room = findRandomOpenRoom();
+      if (!room) room = makeRoom({ theme: randTheme() });
+      ws._roomId = room.roomId;
+      joinRoom(ws, clientId, room, "");
+      // (joined message is sent by joinRoom)
+      return;
+    }
 
-        const room = rooms.get(p.roomId);
-        if (!room) { sendError(ws, "部屋なし", "NO_ROOM"); return; }
-        if (p.frameIndex < 0 || p.frameIndex >= FRAME_COUNT) { sendError(ws, "コマおかしい"); return; }
-        if (room.filled[p.frameIndex]) {
-          const info = ws.joinInfo.get(p.roomId);
-          if (!(room.visibility==="private" && info && info.canEdit==="any")) { sendError(ws, "もうある"); return; }
-        }
-
-        const info = ws.joinInfo.get(p.roomId);
-        if (!info) { sendError(ws, "入ってない"); return; }
-        if (info.canEdit === "view") { sendError(ws, "見るだけ"); return; }
-
-        if (info.canEdit === "assigned") {
-          if (info.assignedFrame !== p.frameIndex) { sendError(ws, "そのコマじゃない"); return; }
-          const r = room.reservations.get(p.frameIndex);
-          if (!r || r.wsId !== ws.wsId || r.token !== info.reservationToken || r.expiresAt <= now()) {
-            sendError(ws, "予約切れ", "RESERVE_END");
-            return;
-          }
-        }
-
-        room.frames[p.frameIndex] = Buffer.from(data);
-        room.filled[p.frameIndex] = true;
-        room.updatedAt = now();
-        releaseReservation(room, p.frameIndex, ws.wsId);
-        room.completed = room.filled.every(Boolean);
-
-        for (const c of room.clients) {
-          send(c, { t:"frame_update_begin", roomId: room.roomId, frameIndex: p.frameIndex, mime: "image/png" });
-          try { c.send(room.frames[p.frameIndex]); } catch {}
-        }
-        broadcastRoomState(room);
-        send(ws, { t:"frame_submit_ok", roomId: room.roomId, frameIndex: p.frameIndex });
+    if (t === "join_room") {
+      const roomId = String(d.roomId || "").trim().toUpperCase();
+      const room = rooms.get(roomId);
+      if (!room) {
+        send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"部屋が見つからない" } });
         return;
       }
+      ws._roomId = room.roomId;
+      joinRoom(ws, clientId, room, d.password || "");
+      return;
+    }
 
-      const txt = data.toString("utf8");
-      let msg = null;
-      try { msg = JSON.parse(txt); } catch { return; }
-      if (!msg || !msg.t) return;
-
-      if (msg.t === "hello") { send(ws, { t:"pong", ts: now() }); return; }
-      if (msg.t === "ping") { send(ws, { t:"pong", ts: msg.ts || now() }); return; }
-      if (msg.t === "pong") return;
-
-      if (msg.t === "create_room") {
-        const visibility = (msg.visibility === "private") ? "private" : "public";
-        const theme = safeTheme(msg.theme) || "お題";
-        const passphrase = visibility==="private" ? String(msg.passphrase || "") : "";
-        if (visibility==="private" && !passphrase) { sendError(ws, "合言葉", "NEED_PASS"); return; }
-
-        const roomId = genRoomId(rooms);
-        const room = makeRoom({ roomId, visibility, theme, passphrase });
-        rooms.set(roomId, room);
-
-
-        // プライベートは完全自由（ローカル版みたいに全部編集できる）
-        if (visibility === "private") {
-          const joinInfo = {
-            canEdit: "any",
-            assignedFrame: null,
-            reservationToken: null,
-            flow: "private",
-            pass: passphrase,
-          };
-          joinRoomSocket(ws, room, joinInfo);
-
-          send(ws, {
-            t:"room_joined",
-            roomId, visibility, theme,
-            canEdit:"any",
-            assignedFrame: null,
-            flow: "private",
-            pass: passphrase,
-          });
-
-          await sendRoomAll(ws, room);
-          return;
-        }
-
-        const assignedFrame = 0;
-        const { token, expiresAt } = reserveFrame(room, assignedFrame, ws.wsId);
-        const joinInfo = {
-          canEdit: "assigned",
-          assignedFrame,
-          reservationToken: token,
-          flow: "create",
-          pass: visibility==="private" ? passphrase : null,
-        };
-        joinRoomSocket(ws, room, joinInfo);
-
-        send(ws, {
-          t:"room_joined",
-          roomId, visibility, theme,
-          canEdit:"assigned",
-          assignedFrame,
-          reservationToken: token,
-          reservationExpiresAt: expiresAt,
-          flow: "create",
-          pass: visibility==="private" ? passphrase : null,
-        });
-
-        await sendRoomAll(ws, room);
+    if (t === "resync") {
+      const roomId = String(d.roomId || rid || "").trim().toUpperCase();
+      const room = rooms.get(roomId);
+      if (!room) {
+        send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"部屋が見つからない" } });
         return;
       }
+      send(ws, { v:1, t:"room_state", ts: nowTs(), data: roomState(room, clientId) });
+      return;
+    }
 
-      if (msg.t === "join_random") {
-        let pool = eligiblePublicRooms(rooms);
-        let room = null;
-
-        if (!pool.length) {
-          const theme = safeTheme(pickRandom([
-            "歩く犬","通勤時間","雨の日","ねこが伸びる","信号待ち","おにぎり","ジャンプ","落ちる"
-          ])) || "歩く犬";
-          const roomId = genRoomId(rooms);
-          room = makeRoom({ roomId, visibility:"public", theme, passphrase:"" });
-          rooms.set(roomId, room);
-        } else {
-          room = pickRandom(pool);
-        }
-
-        const frameIndex = earliestEmptyFrame(room);
-        if (frameIndex === -1) { sendError(ws, "空きなし", "NO_EMPTY"); return; }
-
-        const { token, expiresAt } = reserveFrame(room, frameIndex, ws.wsId);
-
-        const joinInfo = {
-          canEdit: "assigned",
-          assignedFrame: frameIndex,
-          reservationToken: token,
-          flow: "random",
-          pass: null,
-        };
-        joinRoomSocket(ws, room, joinInfo);
-
-        send(ws, {
-          t:"room_joined",
-          roomId: room.roomId,
-          visibility: room.visibility,
-          theme: room.theme,
-          canEdit:"assigned",
-          assignedFrame: frameIndex,
-          reservationToken: token,
-          reservationExpiresAt: expiresAt,
-          flow: "random",
-        });
-
-        await sendRoomAll(ws, room);
+    if (t === "fork_private") {
+      const roomId = String(d.roomId || "").trim().toUpperCase();
+      const room = rooms.get(roomId);
+      if (!room) {
+        send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"元の部屋が見つからない" } });
         return;
       }
+      const pw = String(d.password || "").trim();
+      forkPrivate(ws, clientId, room, pw);
+      return;
+    }
 
-      if (msg.t === "join_private") {
-        const roomId = String(msg.roomId || "").trim().toUpperCase();
-        const passphrase = String(msg.passphrase || "");
-        const room = rooms.get(roomId);
-        if (!room) { sendError(ws, "部屋なし", "NO_ROOM"); return; }
-        if (room.visibility !== "private") { sendError(ws, "プライベートじゃない", "NOT_PRIVATE"); return; }
-        if (!passphrase) { sendError(ws, "合言葉", "NEED_PASS"); return; }
-        if (sha256(passphrase) !== room.passHash) { sendError(ws, "合言葉ちがう", "BAD_PASS"); return; }
-
-        const joinInfo = { canEdit: "any", assignedFrame:null, reservationToken:null, flow:"private", pass: passphrase };
-        joinRoomSocket(ws, room, joinInfo);
-
-        send(ws, {
-          t:"room_joined",
-          roomId: room.roomId,
-          visibility: room.visibility,
-          theme: room.theme,
-          canEdit:"any",
-          assignedFrame: null,
-          flow: "private",
-          pass: passphrase,
-        });
-
-        await sendRoomAll(ws, room);
+    if (t === "submit_frame") {
+      const roomId = String(d.roomId || rid || "").trim().toUpperCase();
+      const room = rooms.get(roomId);
+      if (!room) {
+        send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"部屋が見つからない" } });
         return;
       }
-
-      if (msg.t === "join_view") {
-        const roomId = String(msg.roomId || "").trim().toUpperCase();
-        const room = rooms.get(roomId);
-        if (!room) { sendError(ws, "部屋なし", "NO_ROOM"); return; }
-
-        if (room.visibility === "private") {
-          const passphrase = String(msg.passphrase || "");
-          if (!passphrase) { sendError(ws, "合言葉", "NEED_PASS"); return; }
-          if (sha256(passphrase) !== room.passHash) { sendError(ws, "合言葉ちがう", "BAD_PASS"); return; }
-        }
-
-        const joinInfo = { canEdit:"view", assignedFrame:null, reservationToken:null, flow:"view", pass:null };
-        joinRoomSocket(ws, room, joinInfo);
-
-        send(ws, {
-          t:"room_joined",
-          roomId: room.roomId,
-          visibility: room.visibility,
-          theme: room.theme,
-          canEdit:"view",
-          assignedFrame: null,
-          flow: "view",
-        });
-
-        await sendRoomAll(ws, room);
+      const frameIndex = Number(d.frameIndex);
+      const assigned = room.assignments.get(clientId);
+      if (assigned !== frameIndex) {
+        send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"割当と違うコマは提出できない" } });
         return;
       }
-
-      if (msg.t === "resync") {
-        const roomId = String(msg.roomId || "").trim().toUpperCase();
-        const room = rooms.get(roomId);
-        if (!room) { sendError(ws, "部屋なし", "NO_ROOM"); return; }
-        await sendRoomAll(ws, room);
+      if (!(frameIndex >= 0 && frameIndex < room.frameCount)) {
+        send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"frameIndex out of range" } });
         return;
       }
-
-      // ログ（内部保存。配信しない。）
-      if (msg.t === "log_stroke") {
-        const roomId = String(msg.roomId || "").trim().toUpperCase();
-        const frameIndex = Number(msg.frameIndex);
-        const room = rooms.get(roomId);
-        if (!room) return;
-        if (!Number.isFinite(frameIndex) || frameIndex < 0 || frameIndex >= FRAME_COUNT) return;
-
-        const info = ws.joinInfo.get(roomId);
-        if (!info) return;
-        if (info.canEdit === "view") return;
-        if (info.canEdit === "assigned" && info.assignedFrame !== frameIndex) return;
-
-        const pts = Array.isArray(msg.pts) ? msg.pts : [];
-        const clipped = pts.slice(0, LOG_MAX_POINTS_PER_STROKE).map(p=>{
-          const x = Number(p?.[0]); const y = Number(p?.[1]);
-          if(!Number.isFinite(x) || !Number.isFinite(y)) return null;
-          return [Math.max(0,Math.min(255, x|0)), Math.max(0,Math.min(255, y|0))];
-        }).filter(Boolean);
-
-        if (!clipped.length) return;
-
-        const stroke = {
-          ts: Number(msg.ts || now()),
-          tool: String(msg.tool || "pen"),
-          color: String(msg.color || "#000000").slice(0, 16),
-          size: Math.max(1, Math.min(60, Number(msg.size || 6))),
-          pts: clipped,
-          wsId: ws.wsId,
-        };
-
-        const arr = room.logs[frameIndex];
-        arr.push(stroke);
-        if (arr.length > LOG_MAX_STROKES_PER_FRAME) arr.splice(0, arr.length - LOG_MAX_STROKES_PER_FRAME);
-        room.updatedAt = now();
+      const dataUrl = String(d.dataUrl || "");
+      if (!dataUrl.startsWith("data:image/png;base64,")) {
+        send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"dataUrl must be PNG data URL" } });
         return;
       }
-
-      
-      if (msg.t === "fork_private") {
-        const srcRoomId = String(msg.srcRoomId || "").trim().toUpperCase();
-        const dstRoomIdRaw = String(msg.dstRoomId || "").trim().toUpperCase();
-        const passphrase = String(msg.passphrase || "");
-        const srcPassphrase = String(msg.srcPassphrase || "");
-
-        if (!passphrase) { sendError(ws, "合言葉", "NEED_PASS"); return; }
-
-        const dstRoomId = dstRoomIdRaw.replace(/[^A-Z0-9]/g,"").slice(0,10);
-        if (!dstRoomId || dstRoomId.length < 3) { sendError(ws, "新ID", "BAD_ID"); return; }
-        if (rooms.get(dstRoomId)) { sendError(ws, "そのIDはもうある", "ID_EXISTS"); return; }
-
-        const src = rooms.get(srcRoomId);
-        if (!src) { sendError(ws, "元がない", "NO_SRC"); return; }
-
-        // 元がプライベートなら合言葉が必要
-        if (src.visibility === "private") {
-          if (!srcPassphrase) { sendError(ws, "元の合言葉", "NEED_SRC_PASS"); return; }
-          if (sha256(srcPassphrase) !== src.passHash) { sendError(ws, "元の合言葉ちがう", "BAD_SRC_PASS"); return; }
-        }
-
-        const room = makeRoom({ roomId: dstRoomId, visibility: "private", theme: src.theme, passphrase });
-        // フレームをコピー（ログはコピーしない）
-        for (let i=0;i<FRAME_COUNT;i++){
-          const buf = src.frames[i];
-          if (!buf) continue;
-          room.frames[i] = Buffer.from(buf);
-          room.filled[i] = true;
-        }
-        room.updatedAt = now();
-        room.completed = room.filled.every(Boolean);
-
-        rooms.set(dstRoomId, room);
-
-        const joinInfo = { canEdit: "any", assignedFrame:null, reservationToken:null, flow:"private", pass: passphrase };
-        joinRoomSocket(ws, room, joinInfo);
-
-        send(ws, {
-          t:"room_joined",
-          roomId: room.roomId,
-          visibility: room.visibility,
-          theme: room.theme,
-          canEdit:"any",
-          assignedFrame:null,
-          flow:"private",
-          pass: passphrase,
-        });
-
-        await sendRoomAll(ws, room);
+      // basic size limit (rough)
+      if (dataUrl.length > 1_500_000) {
+        send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"画像が大きすぎる" } });
         return;
       }
+      room.frames[frameIndex] = { committed:true, dataUrl, author: clientId, ts: nowTs() };
+      room.revision++;
 
-if (msg.t === "submit_begin") {
-        const roomId = String(msg.roomId || "").trim().toUpperCase();
-        const frameIndex = Number(msg.frameIndex);
-        const mime = String(msg.mime || "image/png");
-        const room = rooms.get(roomId);
-        if (!room) { sendError(ws, "部屋なし", "NO_ROOM"); return; }
-        if (!Number.isFinite(frameIndex) || frameIndex < 0 || frameIndex >= FRAME_COUNT) {
-          sendError(ws, "コマおかしい", "BAD_FRAME"); return;
-        }
-        if (room.filled[frameIndex] && !(room.visibility==="private" && info && info.canEdit==="any")) { sendError(ws, "もうある", "FILLED"); return; }
+      broadcast(room, { v:1, t:"frame_committed", ts: nowTs(), data:{ roomId: room.roomId, frameIndex, dataUrl, author: clientId } });
+      send(ws, { v:1, t:"submitted", ts: nowTs(), data:{ roomId: room.roomId, frameIndex } });
 
-        const info = ws.joinInfo.get(roomId);
-        if (!info) { sendError(ws, "入ってない", "NOT_JOINED"); return; }
-        if (info.canEdit === "view") { sendError(ws, "見るだけ", "VIEW_ONLY"); return; }
-
-        if (info.canEdit === "assigned") {
-          const tok = String(msg.reservationToken || "");
-          if (!tok || tok !== info.reservationToken) { sendError(ws, "予約ちがう", "BAD_TOKEN"); return; }
-          if (info.assignedFrame !== frameIndex) { sendError(ws, "そのコマじゃない", "NOT_YOURS"); return; }
-          const r = room.reservations.get(frameIndex);
-          if (!r || r.wsId !== ws.wsId || r.token !== tok || r.expiresAt <= now()) {
-            sendError(ws, "予約切れ", "RESERVE_END"); return;
-          }
-        }
-
-        ws.pendingUpload = { roomId, frameIndex, mime, ts: now() };
-        setTimeout(() => {
-          if (!ws.pendingUpload) return;
-          if (ws.pendingUpload.roomId === roomId && ws.pendingUpload.frameIndex === frameIndex) {
-            ws.pendingUpload = null;
-          }
-        }, UPLOAD_TTL_MS);
-        return;
+      // If complete, go playback
+      if (countCommitted(room) >= room.frameCount) {
+        room.phase = "PLAYBACK";
+        room.revision++;
+        broadcast(room, { v:1, t:"start_playback", ts: nowTs(), data:{ roomId: room.roomId, fps: room.fps } });
       }
+      return;
+    }
 
-    } catch (e) {
-      sendError(ws, "サーバーエラー", "EX");
+    // unknown
+    send(ws, { v:1, t:"error", ts: nowTs(), data:{ message:"unknown message type: " + t } });
+  });
+
+  ws.on("close", () => {
+    // Remove from any room clients set
+    for (const room of rooms.values()) {
+      room.clients.delete(ws);
     }
   });
 });
 
-// housekeep
-setInterval(() => cleanupReservations(rooms), HOUSEKEEP_MS);
-
-// ping keepalive
-setInterval(() => {
-  for (const ws of wss.clients) {
-    if (ws.isAlive === false) {
-      try { ws.terminate(); } catch {}
-      continue;
-    }
-    ws.isAlive = false;
-    try { ws.ping(); } catch {}
-  }
-}, PING_MS);
-
 server.listen(PORT, () => {
-  console.log("anim5s server on", PORT);
+  console.log("anim5s server listening on", PORT);
 });

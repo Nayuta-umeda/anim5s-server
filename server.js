@@ -23,7 +23,7 @@ function now() { return Date.now(); }
 function sha256(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex");
 }
-function randId(len=6) {
+function randId(len=7) {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let out = "";
   for (let i=0;i<len;i++) out += chars[(Math.random()*chars.length)|0];
@@ -31,10 +31,10 @@ function randId(len=6) {
 }
 function genRoomId(rooms) {
   for (let i=0;i<30;i++){
-    const id = randId(6);
+    const id = randId(7);
     if (!rooms.has(id)) return id;
   }
-  return randId(8) + randId(2);
+  return randId(10);
 }
 function genToken() {
   return crypto.randomBytes(9).toString("base64url");

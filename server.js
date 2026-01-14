@@ -213,7 +213,10 @@ wss.on("connection", (ws) => {
         const room = rooms.get(p.roomId);
         if (!room) { sendError(ws, "部屋なし", "NO_ROOM"); return; }
         if (p.frameIndex < 0 || p.frameIndex >= FRAME_COUNT) { sendError(ws, "コマおかしい"); return; }
-        if (room.filled[p.frameIndex]) { sendError(ws, "もうある"); return; }
+        if (room.filled[p.frameIndex]) {
+          const info = ws.joinInfo.get(p.roomId);
+          if (!(room.visibility==="private" && info && info.canEdit==="any")) { sendError(ws, "もうある"); return; }
+        }
 
         const info = ws.joinInfo.get(p.roomId);
         if (!info) { sendError(ws, "入ってない"); return; }
@@ -261,6 +264,31 @@ wss.on("connection", (ws) => {
         const roomId = genRoomId(rooms);
         const room = makeRoom({ roomId, visibility, theme, passphrase });
         rooms.set(roomId, room);
+
+
+        // プライベートは完全自由（ローカル版みたいに全部編集できる）
+        if (visibility === "private") {
+          const joinInfo = {
+            canEdit: "any",
+            assignedFrame: null,
+            reservationToken: null,
+            flow: "private",
+            pass: passphrase,
+          };
+          joinRoomSocket(ws, room, joinInfo);
+
+          send(ws, {
+            t:"room_joined",
+            roomId, visibility, theme,
+            canEdit:"any",
+            assignedFrame: null,
+            flow: "private",
+            pass: passphrase,
+          });
+
+          await sendRoomAll(ws, room);
+          return;
+        }
 
         const assignedFrame = 0;
         const { token, expiresAt } = reserveFrame(room, assignedFrame, ws.wsId);
@@ -434,7 +462,60 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      if (msg.t === "submit_begin") {
+      
+      if (msg.t === "fork_private") {
+        const srcRoomId = String(msg.srcRoomId || "").trim().toUpperCase();
+        const dstRoomIdRaw = String(msg.dstRoomId || "").trim().toUpperCase();
+        const passphrase = String(msg.passphrase || "");
+        const srcPassphrase = String(msg.srcPassphrase || "");
+
+        if (!passphrase) { sendError(ws, "合言葉", "NEED_PASS"); return; }
+
+        const dstRoomId = dstRoomIdRaw.replace(/[^A-Z0-9]/g,"").slice(0,10);
+        if (!dstRoomId || dstRoomId.length < 3) { sendError(ws, "新ID", "BAD_ID"); return; }
+        if (rooms.get(dstRoomId)) { sendError(ws, "そのIDはもうある", "ID_EXISTS"); return; }
+
+        const src = rooms.get(srcRoomId);
+        if (!src) { sendError(ws, "元がない", "NO_SRC"); return; }
+
+        // 元がプライベートなら合言葉が必要
+        if (src.visibility === "private") {
+          if (!srcPassphrase) { sendError(ws, "元の合言葉", "NEED_SRC_PASS"); return; }
+          if (sha256(srcPassphrase) !== src.passHash) { sendError(ws, "元の合言葉ちがう", "BAD_SRC_PASS"); return; }
+        }
+
+        const room = makeRoom({ roomId: dstRoomId, visibility: "private", theme: src.theme, passphrase });
+        // フレームをコピー（ログはコピーしない）
+        for (let i=0;i<FRAME_COUNT;i++){
+          const buf = src.frames[i];
+          if (!buf) continue;
+          room.frames[i] = Buffer.from(buf);
+          room.filled[i] = true;
+        }
+        room.updatedAt = now();
+        room.completed = room.filled.every(Boolean);
+
+        rooms.set(dstRoomId, room);
+
+        const joinInfo = { canEdit: "any", assignedFrame:null, reservationToken:null, flow:"private", pass: passphrase };
+        joinRoomSocket(ws, room, joinInfo);
+
+        send(ws, {
+          t:"room_joined",
+          roomId: room.roomId,
+          visibility: room.visibility,
+          theme: room.theme,
+          canEdit:"any",
+          assignedFrame:null,
+          flow:"private",
+          pass: passphrase,
+        });
+
+        await sendRoomAll(ws, room);
+        return;
+      }
+
+if (msg.t === "submit_begin") {
         const roomId = String(msg.roomId || "").trim().toUpperCase();
         const frameIndex = Number(msg.frameIndex);
         const mime = String(msg.mime || "image/png");
@@ -443,7 +524,7 @@ wss.on("connection", (ws) => {
         if (!Number.isFinite(frameIndex) || frameIndex < 0 || frameIndex >= FRAME_COUNT) {
           sendError(ws, "コマおかしい", "BAD_FRAME"); return;
         }
-        if (room.filled[frameIndex]) { sendError(ws, "もうある", "FILLED"); return; }
+        if (room.filled[frameIndex] && !(room.visibility==="private" && info && info.canEdit==="any")) { sendError(ws, "もうある", "FILLED"); return; }
 
         const info = ws.joinInfo.get(roomId);
         if (!info) { sendError(ws, "入ってない", "NOT_JOINED"); return; }

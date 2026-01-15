@@ -15,13 +15,22 @@ function now(){ return Date.now(); }
 function id7(){ return Math.random().toString(36).slice(2, 9).toUpperCase(); }
 function token(){ return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2); }
 
+
+const THEME_POOL = [
+  "走る犬","くるま","宇宙人","おにぎり","雨の日","ジャンプ","落下","変身","ねこパンチ",
+  "通勤時間","料理","かくれんぼ","風船","雪だるま","電車","魔法","釣り","ダンス"
+];
+function randTheme(){
+  return THEME_POOL[Math.floor(Math.random()*THEME_POOL.length)];
+}
+
 const rooms = new Map();
 
 function makeRoom(theme){
   const roomId = id7();
   const room = {
     roomId,
-    theme: (theme && String(theme).trim()) ? String(theme).trim() : "お題",
+    theme: ((theme && String(theme).trim()) ? String(theme).trim() : randTheme()),
     frames: Array.from({length:60}, ()=>null),
     committed: Array.from({length:60}, ()=>false),
     createdAt: now(),
@@ -140,7 +149,7 @@ wss.on("connection", (ws) => {
     if (t === "ping"){ send(ws, { v:1, t:"pong", ts: now(), data:{ ts: d.ts || now() } }); return; }
 
     if (t === "create_public_and_submit"){
-      const theme = d.theme || "お題";
+      const theme = (d.theme && String(d.theme).trim()) ? String(d.theme).trim() : randTheme();
       const dataUrl = d.dataUrl;
       if (!validatePngDataUrl(dataUrl)){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"dataUrl が不正/大きすぎる" } });

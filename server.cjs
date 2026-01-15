@@ -11,6 +11,13 @@ const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
 
+// Phase3 (v17.0): room-level deadline + phase transitions
+// - DRAWING: accepts join_random/submit until deadlineAt
+// - FINALIZING: short grace window to settle state, then PLAYBACK
+// - PLAYBACK: read-only (viewer/gif export)
+const ROOM_DRAW_MS = Number(process.env.ROOM_DRAW_MS || 10 * 60 * 1000); // default 10 minutes
+const FINALIZE_GRACE_MS = Number(process.env.FINALIZE_GRACE_MS || 1500);
+
 function now(){ return Date.now(); }
 function id7(){ return Math.random().toString(36).slice(2, 9).toUpperCase(); }
 function token(){ return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2); }
@@ -28,6 +35,8 @@ const rooms = new Map();
 
 function makeRoom(theme){
   const roomId = id7();
+  const startAt = now();
+  const deadlineAt = startAt + ROOM_DRAW_MS;
   const room = {
     roomId,
     theme: ((theme && String(theme).trim()) ? String(theme).trim() : randTheme()),
@@ -36,6 +45,10 @@ function makeRoom(theme){
     createdAt: now(),
     updatedAt: now(),
     phase: "DRAWING",
+    startAt,
+    deadlineAt,
+    finalizingAt: 0,
+    playbackAt: 0,
     reservations: new Map(),     // token -> {frameIndex, expiresAt}
     reservedByFrame: new Map(),  // frameIndex -> token
   };
@@ -62,9 +75,14 @@ function roomState(room){
     frameCount: 60,
     fps: 12,
     phase: room.phase,
+    startAt: room.startAt,
+    deadlineAt: room.deadlineAt,
+    finalizingAt: room.finalizingAt || 0,
+    playbackAt: room.playbackAt || 0,
     filled: room.committed.slice(),
     updatedAt: room.updatedAt,
-    completed: room.committed.every(Boolean)
+    deadlineReached: now() >= room.deadlineAt,
+    completed: (room.phase === "PLAYBACK") || room.committed.every(Boolean)
   };
 }
 
@@ -83,6 +101,7 @@ function findRandomOpenRoom(){
   for (const r of rooms.values()){
     cleanupReservations(r);
     if (r.phase !== "DRAWING") continue;
+    if (now() >= r.deadlineAt) continue;
     if (r.committed.every(Boolean)) continue;
     list.push(r);
   }
@@ -254,6 +273,16 @@ wss.on("connection", (ws) => {
       }
       cleanupReservations(room);
 
+      // Phase3: deadline / phase gate
+      if (room.phase !== "DRAWING"){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"この部屋は提出を受け付けていません（" + room.phase + "）" } });
+        return;
+      }
+      if (now() >= room.deadlineAt){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"締切を過ぎました（提出不可）" } });
+        return;
+      }
+
       const idx = Number(d.frameIndex);
       const tok = String(d.reservationToken || "");
       const dataUrl = d.dataUrl;
@@ -295,7 +324,9 @@ wss.on("connection", (ws) => {
       send(ws, { v:1, t:"submitted", ts: now(), data:{ roomId: room.roomId, frameIndex: idx } });
 
       if (room.committed.every(Boolean)){
-        room.phase = "PLAYBACK";
+        // Let the phase engine finalize -> playback
+        room.phase = "FINALIZING";
+        room.finalizingAt = now() + FINALIZE_GRACE_MS;
         room.updatedAt = now();
         broadcast(room, { v:1, t:"room_state", ts: now(), data: roomState(room) });
       }
@@ -305,5 +336,36 @@ wss.on("connection", (ws) => {
     send(ws, { v:1, t:"error", ts: now(), data:{ message:"unknown message type: " + t } });
   });
 });
+
+// === Phase3: room phase engine (deadline -> FINALIZING -> PLAYBACK) ===
+function maybeAdvanceRoom(room){
+  const t = now();
+  cleanupReservations(room);
+
+  if (room.phase === "DRAWING"){
+    if (room.committed.every(Boolean) || t >= room.deadlineAt){
+      room.phase = "FINALIZING";
+      room.finalizingAt = t + FINALIZE_GRACE_MS;
+      room.updatedAt = t;
+      broadcast(room, { v:1, t:"room_state", ts: t, data: roomState(room) });
+    }
+    return;
+  }
+
+  if (room.phase === "FINALIZING"){
+    if (t >= (room.finalizingAt || 0)){
+      room.phase = "PLAYBACK";
+      room.playbackAt = t;
+      room.updatedAt = t;
+      broadcast(room, { v:1, t:"start_playback", ts: t, data:{ roomId: room.roomId, playbackAt: room.playbackAt } });
+      broadcast(room, { v:1, t:"room_state", ts: t, data: roomState(room) });
+    }
+    return;
+  }
+}
+
+setInterval(() => {
+  for (const room of rooms.values()) maybeAdvanceRoom(room);
+}, 1000);
 
 server.listen(PORT, "0.0.0.0", () => console.log("anim5s server listening on", PORT));

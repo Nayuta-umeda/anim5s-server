@@ -11,6 +11,12 @@
 - プライベート作品は **ローカル保存のみ**（サーバに送信しません）。
 - 「テーマに参加」は **予約トークン方式**（期限あり / 提出時に検証）。
 
+## Phase3 追加（v17.0）
+- 部屋ごとに締切（`deadlineAt`）を持ち、締切を過ぎると **提出不可** → 短いFINALIZINGの後にPLAYBACKになります。
+- サーバ環境変数で調整できます：
+  - `ROOM_DRAW_MS` (既定 10分)
+  - `FINALIZE_GRACE_MS` (既定 1500ms)
+
 ## フォルダ
 - `client/` : GitHub Pages 等に置く静的ファイル
 - `server/` : Render 等で動かす WebSocket サーバ（/ws）

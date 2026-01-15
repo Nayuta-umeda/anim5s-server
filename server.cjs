@@ -325,6 +325,26 @@ wss.on("connection", (ws) => {
     const t = String(m.t || "");
     const d = m.data || {};
 
+
+    // Backward-compatible handshake (older clients send these)
+    if (t === "hello"){
+      send(ws, { v:1, t:"welcome", ts: now(), data:{ protocol:1, serverTime: now() } });
+      return;
+    }
+    // Backward-compatible resync: keep lightweight (clients should request frames via get_frame)
+    if (t === "resync"){
+      const roomId = String(d.roomId || ws._roomId || "").trim().toUpperCase();
+      if (!roomId) return;
+      const room = getRoom(roomId);
+      if (!room){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
+        return;
+      }
+      ws._roomId = room.roomId;
+      send(ws, { v:1, t:"room_state", ts: now(), data: roomState(room) });
+      return;
+    }
+
     if (t === "create_public_and_submit"){
       const theme = (d.theme && String(d.theme).trim()) ? String(d.theme).trim() : randTheme();
       const dataUrl = d.dataUrl;

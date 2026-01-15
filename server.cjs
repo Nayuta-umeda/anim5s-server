@@ -423,7 +423,7 @@ wss.on("connection", (ws) => {
       normalizePhase(room);
       if (room.phase !== "DRAWING"){
         // completed rooms are excluded from editing/joining
-        send(ws, { v:1, t:"error", ts: now(), data:{ message:"完成済みの部屋は編集できません" } });
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
         return;
       }
       const idx = firstYoungestEmpty(room);

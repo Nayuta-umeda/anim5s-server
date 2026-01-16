@@ -44,6 +44,13 @@ function randTheme(){ return THEME_POOL[Math.floor(Math.random()*THEME_POOL.leng
 function id7(){ return Math.random().toString(36).slice(2,9).toUpperCase(); }
 function token(){ return Math.random().toString(36).slice(2) + "-" + Math.random().toString(36).slice(2); }
 
+const ROOM_ID_RE = /^[A-Z0-9]{6,12}$/;
+function normalizeRoomId(x){
+  const id = String(x || "").trim().toUpperCase();
+  if (!ROOM_ID_RE.test(id)) return "";
+  return id;
+}
+
 function validatePngDataUrl(s){
   if (typeof s !== "string") return false;
   if (!s.startsWith("data:image/")) return false;
@@ -68,7 +75,9 @@ function saveIndex(){
 }
 
 function roomFile(roomId){
-  return path.join(ROOMS_DIR, roomId + ".json");
+  const id = normalizeRoomId(roomId);
+  if (!id) throw new Error("invalid roomId");
+  return path.join(ROOMS_DIR, id + ".json");
 }
 
 function cleanupReservations(room){
@@ -93,7 +102,8 @@ function normalizePhase(room){
 }
 
 function deserializeRoom(obj){
-  const roomId = String(obj?.roomId || "").trim().toUpperCase();
+  const roomId = normalizeRoomId(obj?.roomId);
+  if (!roomId) return null;
   const frames = Array.isArray(obj?.frames) ? obj.frames.slice(0,60) : [];
   const committed = Array.isArray(obj?.committed) ? obj.committed.slice(0,60).map(Boolean) : [];
   while (frames.length < 60) frames.push(null);
@@ -171,7 +181,7 @@ function touch(roomId){
 }
 
 function getRoom(roomId){
-  const id = String(roomId || "").trim().toUpperCase();
+  const id = normalizeRoomId(roomId);
   if (!id) return null;
 
   const e = cache.get(id);
@@ -187,6 +197,7 @@ function getRoom(roomId){
     const raw = fs.readFileSync(fp, "utf8");
     const obj = JSON.parse(raw);
     const room = deserializeRoom(obj);
+    if (!room) return null;
     cache.set(id, { room, lastAccess: now() });
     return room;
   }catch(e2){
@@ -306,7 +317,7 @@ const server = http.createServer((req, res) => {
   res.end("anim5s ok");
 });
 
-const wss = new WebSocket.Server({ noServer:true });
+const wss = new WebSocket.Server({ noServer:true, maxPayload: 2_000_000 });
 
 server.on("upgrade", (req, socket, head) => {
   if (req.url !== "/ws"){
@@ -333,8 +344,8 @@ wss.on("connection", (ws) => {
     }
     // Backward-compatible resync: keep lightweight (clients should request frames via get_frame)
     if (t === "resync"){
-      const roomId = String(d.roomId || ws._roomId || "").trim().toUpperCase();
-      if (!roomId) return;
+      const roomId = normalizeRoomId(d.roomId || ws._roomId);
+      if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
@@ -410,9 +421,9 @@ wss.on("connection", (ws) => {
     }
 
     if (t === "join_by_id"){
-      const roomId = String(d.roomId || "").trim().toUpperCase();
+      const roomId = normalizeRoomId(d.roomId);
       if (!roomId){
-        send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が必要です" } });
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } });
         return;
       }
       const room = getRoom(roomId);
@@ -453,7 +464,8 @@ wss.on("connection", (ws) => {
     }
 
     if (t === "join_room"){
-      const roomId = String(d.roomId || "").trim().toUpperCase();
+      const roomId = normalizeRoomId(d.roomId || ws._roomId);
+      if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
@@ -481,7 +493,8 @@ wss.on("connection", (ws) => {
     }
 
     if (t === "resync"){
-      const roomId = String(d.roomId || ws._roomId || "").trim().toUpperCase();
+      const roomId = normalizeRoomId(d.roomId || ws._roomId);
+      if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
@@ -493,7 +506,8 @@ wss.on("connection", (ws) => {
     }
 
     if (t === "get_frame"){
-      const roomId = String(d.roomId || ws._roomId || "").trim().toUpperCase();
+      const roomId = normalizeRoomId(d.roomId || ws._roomId);
+      if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
@@ -510,7 +524,8 @@ wss.on("connection", (ws) => {
     }
 
     if (t === "submit_frame"){
-      const roomId = String(d.roomId || ws._roomId || "").trim().toUpperCase();
+      const roomId = normalizeRoomId(d.roomId || ws._roomId);
+      if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });

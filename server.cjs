@@ -1,5 +1,5 @@
 /**
- * anim5s server (spec 2026-01-15) — Phase4 Step2 hardening (V42)
+ * anim5s server (spec 2026-01-15) — Phase4 Step2 hardening + Step3 monitoring (V43)
  * Policy updates:
  *  - Rooms do NOT expire by time; unfinished rooms can be edited anytime.
  *  - Completed rooms (all frames committed) are NOT editable and are excluded from random/ID-join.
@@ -48,6 +48,42 @@ const THEME_POOL = [
   "走る犬","くるま","宇宙人","おにぎり","雨の日","ジャンプ","落下","変身","ねこパンチ",
   "通勤時間","料理","かくれんぼ","風船","雪だるま","電車","魔法","釣り","ダンス"
 ];
+
+
+// --- Step3: basic monitoring (metrics + structured logs) ---
+const STARTED_AT = Date.now();
+const METRICS = {
+  counters: Object.create(null),
+  ms: Object.create(null), // op -> {count,sum,max}
+};
+let LAST_ERROR = { ts: 0, code: "", message: "" };
+
+function metricKey(s){
+  return String(s || "unknown").replace(/[^a-zA-Z0-9_]/g, "_");
+}
+function inc(name, n=1){
+  const k = metricKey(name);
+  METRICS.counters[k] = (METRICS.counters[k] || 0) + (Number(n) || 0);
+}
+function observeMs(op, ms){
+  const k = metricKey(op);
+  let o = METRICS.ms[k];
+  if (!o) o = METRICS.ms[k] = { count: 0, sum: 0, max: 0 };
+  o.count += 1;
+  o.sum += ms;
+  if (ms > o.max) o.max = ms;
+}
+function uptimeSec(){
+  return Math.max(0, Math.floor((Date.now() - STARTED_AT) / 1000));
+}
+function logLine(level, event, data){
+  try{
+    const out = Object.assign({ ts: new Date().toISOString(), level, event }, data || {});
+    console.log(JSON.stringify(out));
+  }catch(e){
+    console.log(level, event);
+  }
+}
 
 function now(){ return Date.now(); }
 function randTheme(){ return THEME_POOL[Math.floor(Math.random()*THEME_POOL.length)]; }
@@ -390,7 +426,22 @@ function findRandomOpenRoomId(){
 }
 
 function send(ws, obj){
-  try{ ws.send(JSON.stringify(obj)); }catch(e){}
+  try{
+    if (obj && obj.t){
+      const t = metricKey(obj.t);
+      inc('ws_send_total');
+      inc('ws_send_type_' + t);
+      if (t === 'error'){
+        inc('errors_total');
+        const code = (obj.data && obj.data.code) ? String(obj.data.code) : '';
+        const message = (obj.data && obj.data.message) ? String(obj.data.message) : '';
+        LAST_ERROR = { ts: now(), code, message };
+        // keep logs small (do not include payload)
+        logLine('warn', 'ws_error_send', { roomId: ws?._roomId || '', code, message });
+      }
+    }
+    ws.send(JSON.stringify(obj));
+  }catch(e){}
 }
 function broadcast(roomId, obj){
   const text = JSON.stringify(obj);
@@ -402,15 +453,97 @@ function broadcast(roomId, obj){
 }
 
 const server = http.createServer((req, res) => {
-  if (req.url === "/health"){
+  if (req.url === "/health" || req.url === "/healthz"){
     res.writeHead(200, { "content-type":"application/json" });
     let roomsOnDisk = 0;
     let backups = 0;
     try{ roomsOnDisk = fs.readdirSync(ROOMS_DIR).filter(f=>f.endsWith(".json")).length; }catch(e){}
     try{ backups = fs.readdirSync(BACKUP_DIR).filter(n=>!n.startsWith(".")).length; }catch(e){}
-    res.end(JSON.stringify({ ok:true, roomsInIndex: Object.keys(index).length, roomsOnDisk, cachedRooms: cache.size, backups, dataDir: DATA_DIR, ts: now() }));
+
+    const mu = process.memoryUsage();
+    res.end(JSON.stringify({
+      ok: true,
+      ts: now(),
+      uptimeSec: uptimeSec(),
+      wsClients: wss?.clients ? wss.clients.size : 0,
+      roomsInIndex: Object.keys(index).length,
+      roomsOnDisk,
+      cachedRooms: cache.size,
+      backups,
+      dataDir: DATA_DIR,
+      counters: METRICS.counters,
+      lastError: LAST_ERROR,
+      memory: {
+        rss: mu.rss,
+        heapTotal: mu.heapTotal,
+        heapUsed: mu.heapUsed,
+        external: mu.external,
+      }
+    }));
     return;
   }
+
+  if (req.url === "/metrics"){
+    res.writeHead(200, { "content-type":"text/plain; charset=utf-8" });
+    const mu = process.memoryUsage();
+    const lines = [];
+    lines.push('# HELP anim5s_uptime_seconds Process uptime in seconds');
+    lines.push('# TYPE anim5s_uptime_seconds gauge');
+    lines.push('anim5s_uptime_seconds ' + uptimeSec());
+
+    lines.push('# HELP anim5s_ws_clients Current websocket clients');
+    lines.push('# TYPE anim5s_ws_clients gauge');
+    lines.push('anim5s_ws_clients ' + (wss?.clients ? wss.clients.size : 0));
+
+    lines.push('# HELP anim5s_rooms_in_index Rooms in index');
+    lines.push('# TYPE anim5s_rooms_in_index gauge');
+    lines.push('anim5s_rooms_in_index ' + Object.keys(index).length);
+
+    let roomsOnDisk = 0;
+    try{ roomsOnDisk = fs.readdirSync(ROOMS_DIR).filter(f=>f.endsWith(".json")).length; }catch(e){}
+    lines.push('# HELP anim5s_rooms_on_disk Rooms json files on disk');
+    lines.push('# TYPE anim5s_rooms_on_disk gauge');
+    lines.push('anim5s_rooms_on_disk ' + roomsOnDisk);
+
+    lines.push('# HELP anim5s_cached_rooms Cached rooms in memory');
+    lines.push('# TYPE anim5s_cached_rooms gauge');
+    lines.push('anim5s_cached_rooms ' + cache.size);
+
+    let backups = 0;
+    try{ backups = fs.readdirSync(BACKUP_DIR).filter(n=>!n.startsWith(".")).length; }catch(e){}
+    lines.push('# HELP anim5s_backups Backups kept on disk');
+    lines.push('# TYPE anim5s_backups gauge');
+    lines.push('anim5s_backups ' + backups);
+
+    lines.push('# HELP anim5s_memory_rss_bytes Resident set size');
+    lines.push('# TYPE anim5s_memory_rss_bytes gauge');
+    lines.push('anim5s_memory_rss_bytes ' + mu.rss);
+
+    lines.push('# HELP anim5s_counter_total Generic counters');
+    lines.push('# TYPE anim5s_counter_total counter');
+    for (const [k,v] of Object.entries(METRICS.counters)){
+      const name = String(k).replace(/[^a-zA-Z0-9_]/g,'_');
+      lines.push(`anim5s_counter_total{name="${name}"} ${Number(v) || 0}`);
+    }
+
+    lines.push('# HELP anim5s_op_ms Operation duration in ms (sum/count/max)');
+    lines.push('# TYPE anim5s_op_ms_sum counter');
+    for (const [op,o] of Object.entries(METRICS.ms)){
+      const name = String(op).replace(/[^a-zA-Z0-9_]/g,'_');
+      lines.push(`anim5s_op_ms_sum{op="${name}"} ${Number(o.sum) || 0}`);
+      lines.push(`anim5s_op_ms_count{op="${name}"} ${Number(o.count) || 0}`);
+      lines.push(`anim5s_op_ms_max{op="${name}"} ${Number(o.max) || 0}`);
+    }
+
+    // last error as info gauge
+    lines.push('# HELP anim5s_last_error_ts Last error timestamp (ms since epoch, 0 if none)');
+    lines.push('# TYPE anim5s_last_error_ts gauge');
+    lines.push('anim5s_last_error_ts ' + (LAST_ERROR.ts || 0));
+
+    res.end(lines.join('\n') + '\n');
+    return;
+  }
+
   res.writeHead(200, { "content-type":"text/plain; charset=utf-8" });
   res.end("anim5s ok");
 });
@@ -428,10 +561,24 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (ws) => {
   ws._roomId = "";
 
+  inc('ws_connections_total');
+  logLine('info','ws_open', { remote: (ws._socket && ws._socket.remoteAddress) ? ws._socket.remoteAddress : '' });
+
+  ws.on('close', (code, reason) => {
+    inc('ws_disconnect_total');
+    logLine('info','ws_close', { code, reason: String(reason||'') });
+  });
+
   ws.on("message", (buf) => {
+  const msgStart = now();
+  let opName = 'unknown';
+  try{
     let m = null;
-    try{ m = JSON.parse(String(buf)); }catch(e){ return; }
+    try{ m = JSON.parse(String(buf)); }catch(e){ inc('ws_bad_json_total'); return; }
     const t = String(m.t || "");
+    opName = metricKey(t || 'unknown');
+    inc('ws_messages_total');
+    inc('ws_msg_type_' + opName);
     const d = m.data || {};
 
 
@@ -694,6 +841,9 @@ wss.on("connection", (ws) => {
     }
 
     send(ws, { v:1, t:"error", ts: now(), data:{ message:"unknown message type: " + t } });
+  } finally {
+    observeMs('ws_' + opName, now() - msgStart);
+  }
   });
 });
 

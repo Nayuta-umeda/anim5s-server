@@ -1,5 +1,5 @@
 /**
- * anim5s server (spec 2026-01-15) — Phase4 Step2 hardening + Step3 monitoring (V43)
+ * anim5s server (spec 2026-01-15) — Phase4 Step2 hardening + Step3 monitoring (V44)
  * Policy updates:
  *  - Rooms do NOT expire by time; unfinished rooms can be edited anytime.
  *  - Completed rooms (all frames committed) are NOT editable and are excluded from random/ID-join.
@@ -174,10 +174,17 @@ function roomFile(roomId){
 function cleanupReservations(room){
   const t = now();
   for (const [tok, r] of room.reservations.entries()){
-    if (!r || r.expiresAt <= t || room.committed[r.frameIndex]){
+    const fi = (r && Number.isFinite(r.frameIndex)) ? r.frameIndex : -1;
+    const ex = r ? (Number(r.expiresAt) || 0) : 0;
+    const expired = (!r) || (ex <= t);
+    const invalid = !(fi >= 0 && fi < 60);
+    const committed = (!invalid) ? Boolean(room.committed[fi]) : false;
+    if (expired || committed || invalid){
       room.reservations.delete(tok);
-      const curTok = room.reservedByFrame.get(r.frameIndex);
-      if (curTok === tok) room.reservedByFrame.delete(r.frameIndex);
+      if (!invalid){
+        const curTok = room.reservedByFrame.get(fi);
+        if (curTok === tok) room.reservedByFrame.delete(fi);
+      }
     }
   }
 }
@@ -453,15 +460,26 @@ function broadcast(roomId, obj){
 }
 
 const server = http.createServer((req, res) => {
-  if (req.url === "/health" || req.url === "/healthz"){
-    res.writeHead(200, { "content-type":"application/json" });
+  let u = null;
+  let pathname = "/";
+  try{
+    u = new URL(req.url || "/", "http://localhost");
+    pathname = u.pathname || "/";
+  }catch(e){
+    u = new URL("/", "http://localhost");
+    pathname = String(req.url || "/").split("?")[0] || "/";
+  }
+
+  const accept = String(req.headers["accept"] || "");
+
+  function healthSnapshot(){
     let roomsOnDisk = 0;
     let backups = 0;
     try{ roomsOnDisk = fs.readdirSync(ROOMS_DIR).filter(f=>f.endsWith(".json")).length; }catch(e){}
     try{ backups = fs.readdirSync(BACKUP_DIR).filter(n=>!n.startsWith(".")).length; }catch(e){}
 
     const mu = process.memoryUsage();
-    res.end(JSON.stringify({
+    return {
       ok: true,
       ts: now(),
       uptimeSec: uptimeSec(),
@@ -479,11 +497,122 @@ const server = http.createServer((req, res) => {
         heapUsed: mu.heapUsed,
         external: mu.external,
       }
-    }));
+    };
+  }
+
+  function esc(s){
+    return String(s ?? "").replace(/[&<>\"']/g, (c)=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  }
+
+  function fmtBytes(n){
+    const x = Number(n) || 0;
+    const units = ["B","KB","MB","GB","TB"]; 
+    let v = x;
+    let i = 0;
+    while (v >= 1024 && i < units.length-1){ v /= 1024; i++; }
+    return (i === 0) ? (v.toFixed(0) + " " + units[i]) : (v.toFixed(1) + " " + units[i]);
+  }
+
+  function fmtIso(ms){
+    const t = Number(ms) || 0;
+    if (!t) return "なし";
+    try{ return new Date(t).toISOString(); }catch(e){ return String(t); }
+  }
+
+  function renderHealthHtmlJa(s){
+    const le = s.lastError || { ts: 0, code: "", message: "" };
+    const rows = [
+      ["状態", s.ok ? "OK" : "NG"],
+      ["時刻(UTC)", fmtIso(s.ts)],
+      ["稼働時間(秒)", String(s.uptimeSec)],
+      ["WebSocket接続数", String(s.wsClients)],
+      ["部屋数(index)", String(s.roomsInIndex)],
+      ["部屋数(ディスク)", String(s.roomsOnDisk)],
+      ["キャッシュ中の部屋数", String(s.cachedRooms)],
+      ["バックアップ数", String(s.backups)],
+      ["保存先(DATA_DIR)", String(s.dataDir)],
+      ["直近エラー時刻", fmtIso(le.ts)],
+      ["直近エラーコード", le.code ? String(le.code) : "なし"],
+      ["直近エラーメッセージ", le.message ? String(le.message) : "なし"],
+      ["メモリ(rss)", fmtBytes(s.memory?.rss)],
+      ["メモリ(heapUsed)", fmtBytes(s.memory?.heapUsed)],
+      ["メモリ(heapTotal)", fmtBytes(s.memory?.heapTotal)],
+    ];
+
+    const counters = Object.entries(s.counters || {}).sort((a,b)=>a[0].localeCompare(b[0]));
+    const counterHtml = counters.length
+      ? counters.map(([k,v])=>`<tr><td class="k">${esc(k)}</td><td class="v">${esc(v)}</td></tr>`).join("\n")
+      : `<tr><td class="k">(なし)</td><td class="v">0</td></tr>`;
+
+    const jsonUrl = "/health?format=json";
+    const htmlUrl = "/health?format=html";
+    const metricsUrl = "/metrics";
+
+    return `<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>anim5s ヘルスチェック</title>
+  <style>
+    :root{ color-scheme: dark; --bg:#0b0d10; --panel:#141722; --line:rgba(255,255,255,.10); --text:#e6e6eb; --muted:rgba(230,230,235,.75); }
+    body{ margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; }
+    .wrap{ max-width: 880px; margin: 0 auto; padding: 16px; }
+    .card{ background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; }
+    h1{ margin:0 0 10px 0; font-size:18px; opacity:.92; }
+    .links{ margin: 6px 0 12px; font-size: 13px; color: var(--muted); }
+    a{ color:#7aa7ff; text-decoration:none; }
+    a:hover{ text-decoration:underline; }
+    table{ width:100%; border-collapse:collapse; font-size:14px; }
+    td{ padding:10px 8px; border-top:1px solid var(--line); vertical-align:top; }
+    td.k{ width: 38%; color: var(--muted); }
+    .sub{ margin-top: 14px; color: var(--muted); font-size: 12px; }
+    .grid{ display:grid; grid-template-columns: 1fr; gap: 12px; }
+    @media(min-width:860px){ .grid{ grid-template-columns: 1fr 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="grid">
+      <div class="card">
+        <h1>ヘルス概要（人間向け・日本語）</h1>
+        <div class="links">表示: <a href="${htmlUrl}">HTML</a> / <a href="${jsonUrl}">JSON</a> / <a href="${metricsUrl}">Metrics</a></div>
+        <table>
+          ${rows.map(([k,v])=>`<tr><td class="k">${esc(k)}</td><td class="v">${esc(v)}</td></tr>`).join("\n")}
+        </table>
+        <div class="sub">※ 外形監視ツールには <code>/health?format=json</code> を使うと安全。</div>
+      </div>
+      <div class="card">
+        <h1>カウンタ（簡易メトリクス）</h1>
+        <table>
+          ${counterHtml}
+        </table>
+        <div class="sub">※ 詳細な時系列が欲しくなったら Prometheus/Grafana へ。</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+  }
+
+  if (pathname === "/health" || pathname === "/healthz" || pathname === "/health-ja" || pathname === "/health_ja"){
+    const format = String(u.searchParams.get("format") || u.searchParams.get("view") || "").toLowerCase();
+    const wantsJson = (format === "json");
+    const wantsHtml = (format === "html") || (!wantsJson && accept.includes("text/html")) || (pathname === "/health-ja" || pathname === "/health_ja");
+
+    const snap = healthSnapshot();
+    if (wantsHtml){
+      res.writeHead(200, { "content-type":"text/html; charset=utf-8" });
+      res.end(renderHealthHtmlJa(snap));
+      return;
+    }
+
+    res.writeHead(200, { "content-type":"application/json; charset=utf-8" });
+    res.end(JSON.stringify(snap));
     return;
   }
 
-  if (req.url === "/metrics"){
+  if (pathname === "/metrics"){
     res.writeHead(200, { "content-type":"text/plain; charset=utf-8" });
     const mu = process.memoryUsage();
     const lines = [];

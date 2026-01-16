@@ -1,5 +1,5 @@
 /**
- * anim5s server (spec 2026-01-15) — Phase3 update (v17.1)
+ * anim5s server (spec 2026-01-15) — Phase4 Step2 hardening (V42)
  * Policy updates:
  *  - Rooms do NOT expire by time; unfinished rooms can be edited anytime.
  *  - Completed rooms (all frames committed) are NOT editable and are excluded from random/ID-join.
@@ -27,6 +27,16 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const ROOMS_DIR = path.join(DATA_DIR, "rooms");
 const INDEX_FILE = path.join(DATA_DIR, "rooms_index.json");
 fs.mkdirSync(ROOMS_DIR, { recursive: true });
+
+// Backups (incremental snapshots)
+const BACKUP_DIR = path.join(DATA_DIR, "backups");
+fs.mkdirSync(BACKUP_DIR, { recursive: true });
+const BACKUP_INTERVAL_MS = Number(process.env.BACKUP_INTERVAL_MS || 30 * 60 * 1000); // 30 min
+const BACKUP_KEEP = Number(process.env.BACKUP_KEEP || 24);
+
+// Track changed rooms for incremental backups
+const dirtyRoomIds = new Set();
+let lastBackupAt = 0;
 
 const ROOM_CACHE_MAX = Number(process.env.ROOM_CACHE_MAX || 80);
 const ROOM_CACHE_IDLE_MS = Number(process.env.ROOM_CACHE_IDLE_MS || 5 * 60 * 1000); // 5 min
@@ -58,20 +68,65 @@ function validatePngDataUrl(s){
   return true;
 }
 
+function safeReadJson(fp){
+  try{ return JSON.parse(fs.readFileSync(fp, "utf8")); }catch(e){ return null; }
+}
+
+function atomicWriteFile(fp, data){
+  const dir = path.dirname(fp);
+  try{ fs.mkdirSync(dir, { recursive: true }); }catch(e){}
+  const tmp = fp + ".tmp_" + process.pid + "_" + Date.now();
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, fp);
+}
+
 function loadIndex(){
-  try{
-    const raw = fs.readFileSync(INDEX_FILE, "utf8");
-    const obj = JSON.parse(raw);
-    return (obj && typeof obj === "object") ? obj : {};
-  }catch(e){
-    return {};
-  }
+  const obj = safeReadJson(INDEX_FILE);
+  return (obj && typeof obj === "object") ? obj : {};
 }
 let index = loadIndex();
+
+function rebuildIndexFromDisk(){
+  const out = {};
+  let files = [];
+  try{ files = fs.readdirSync(ROOMS_DIR); }catch(e){ return out; }
+
+  for (const f of files){
+    if (!f.endsWith(".json")) continue;
+    const fp = path.join(ROOMS_DIR, f);
+    const obj = safeReadJson(fp);
+    if (!obj) continue;
+
+    const rid = normalizeRoomId(obj.roomId || f.slice(0, -5));
+    if (!rid) continue;
+
+    const theme = (obj.theme && String(obj.theme).trim()) ? String(obj.theme).trim() : "";
+    const createdAt = Number(obj.createdAt || 0) || 0;
+    const updatedAt = Number(obj.updatedAt || 0) || 0;
+
+    const committedArr = Array.isArray(obj.committed) ? obj.committed.map(Boolean)
+                      : (Array.isArray(obj.filled) ? obj.filled.map(Boolean) : []);
+    const filledCount = committedArr.reduce((a,b)=>a+(b?1:0), 0);
+    const completed = (String(obj.phase || "") === "PLAYBACK") || filledCount >= 60;
+
+    out[rid] = { roomId: rid, theme, createdAt, updatedAt, filledCount, completed };
+  }
+  return out;
+}
+
 function saveIndex(){
   try{
-    fs.writeFileSync(INDEX_FILE, JSON.stringify(index));
+    atomicWriteFile(INDEX_FILE, JSON.stringify(index));
   }catch(e){}
+}
+
+// If index is missing/corrupted but rooms exist on disk, rebuild lazily on start.
+if (!Object.keys(index).length){
+  const rebuilt = rebuildIndexFromDisk();
+  if (Object.keys(rebuilt).length){
+    index = rebuilt;
+    try{ atomicWriteFile(INDEX_FILE, JSON.stringify(index)); }catch(e){}
+  }
 }
 
 function roomFile(roomId){
@@ -210,7 +265,8 @@ function saveRoom(room){
     normalizePhase(room);
     cleanupReservations(room);
     updateIndexFromRoom(room);
-    fs.writeFileSync(roomFile(room.roomId), JSON.stringify(serializeRoom(room)));
+    atomicWriteFile(roomFile(room.roomId), JSON.stringify(serializeRoom(room)));
+    dirtyRoomIds.add(room.roomId);
     saveIndex();
   }catch(e){}
 }
@@ -235,6 +291,44 @@ function evictCache(){
   }
 }
 setInterval(evictCache, 15_000);
+
+function pruneBackups(){
+  try{
+    const dirs = fs.readdirSync(BACKUP_DIR).filter(n=>!n.startsWith("."));
+    dirs.sort();
+    const over = dirs.length - BACKUP_KEEP;
+    for (let i=0;i<over;i++){
+      fs.rmSync(path.join(BACKUP_DIR, dirs[i]), { recursive:true, force:true });
+    }
+  }catch(e){}
+}
+
+function doBackup(){
+  const t = now();
+  if ((t - lastBackupAt) < BACKUP_INTERVAL_MS) return;
+  if (dirtyRoomIds.size === 0) return;
+
+  const stamp = new Date(t).toISOString().replace(/[:.]/g, "-");
+  const dir = path.join(BACKUP_DIR, stamp);
+  try{
+    fs.mkdirSync(dir, { recursive:true });
+    atomicWriteFile(path.join(dir, "rooms_index.json"), JSON.stringify(index));
+    atomicWriteFile(path.join(dir, "manifest.json"), JSON.stringify({ ts: t, rooms: Array.from(dirtyRoomIds) }));
+    for (const rid of dirtyRoomIds){
+      try{
+        const src = roomFile(rid);
+        const dst = path.join(dir, rid + ".json");
+        if (fs.existsSync(src)) fs.copyFileSync(src, dst);
+      }catch(e){}
+    }
+    dirtyRoomIds.clear();
+    lastBackupAt = t;
+    pruneBackups();
+  }catch(e){}
+}
+
+// Run backup checks periodically (backs up only when there were changes)
+setInterval(doBackup, 30_000);
 
 function makeRoom(theme){
   const roomId = id7();
@@ -310,7 +404,11 @@ function broadcast(roomId, obj){
 const server = http.createServer((req, res) => {
   if (req.url === "/health"){
     res.writeHead(200, { "content-type":"application/json" });
-    res.end(JSON.stringify({ ok:true, roomsInIndex: Object.keys(index).length, cachedRooms: cache.size, ts: now() }));
+    let roomsOnDisk = 0;
+    let backups = 0;
+    try{ roomsOnDisk = fs.readdirSync(ROOMS_DIR).filter(f=>f.endsWith(".json")).length; }catch(e){}
+    try{ backups = fs.readdirSync(BACKUP_DIR).filter(n=>!n.startsWith(".")).length; }catch(e){}
+    res.end(JSON.stringify({ ok:true, roomsInIndex: Object.keys(index).length, roomsOnDisk, cachedRooms: cache.size, backups, dataDir: DATA_DIR, ts: now() }));
     return;
   }
   res.writeHead(200, { "content-type":"text/plain; charset=utf-8" });

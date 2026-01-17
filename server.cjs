@@ -1,5 +1,5 @@
 /**
- * anim5s server (spec 2026-01-15) — Phase4 Step2 hardening + Step3 monitoring (V44)
+ * anim5s server (spec 2026-01-15) — Phase4 Step2 hardening + Step3 monitoring + Step4 ops tools (V45)
  * Policy updates:
  *  - Rooms do NOT expire by time; unfinished rooms can be edited anytime.
  *  - Completed rooms (all frames committed) are NOT editable and are excluded from random/ID-join.
@@ -21,6 +21,7 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
+const ADMIN_KEY = String(process.env.ADMIN_KEY || "");
 
 // Persist/cache
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
@@ -43,6 +44,25 @@ const ROOM_CACHE_IDLE_MS = Number(process.env.ROOM_CACHE_IDLE_MS || 5 * 60 * 100
 
 // Reservation
 const RESERVATION_MS = Number(process.env.RESERVATION_MS || 3 * 60 * 1000);
+
+// --- Step4: minimal ops tooling ---
+// Quarantine list (rooms treated as "not found")
+const QUARANTINE_FILE = path.join(DATA_DIR, "quarantine.json");
+let quarantineSet = new Set();
+
+// Minimal rate limiting (per IP + message type)
+const RATE_BUCKETS = new Map(); // key -> {count, resetAt}
+const RATE_DEFAULT = { windowMs: 10_000, max: 50 };
+const RATE_BY_OP = {
+  hello: { windowMs: 10_000, max: 120 },
+  get_frame: { windowMs: 10_000, max: 90 },
+  join_room: { windowMs: 10_000, max: 40 },
+  resync: { windowMs: 10_000, max: 30 },
+  join_random: { windowMs: 10_000, max: 18 },
+  join_by_id: { windowMs: 10_000, max: 18 },
+  create_public_and_submit: { windowMs: 60_000, max: 12 },
+  submit_frame: { windowMs: 60_000, max: 10 },
+};
 
 const THEME_POOL = [
   "走る犬","くるま","宇宙人","おにぎり","雨の日","ジャンプ","落下","変身","ねこパンチ",
@@ -115,6 +135,70 @@ function atomicWriteFile(fp, data){
   fs.writeFileSync(tmp, data);
   fs.renameSync(tmp, fp);
 }
+
+// --- Step4: quarantine persistence ---
+function loadQuarantineSet(){
+  const obj = safeReadJson(QUARANTINE_FILE);
+  const ids = Array.isArray(obj?.roomIds) ? obj.roomIds : (Array.isArray(obj) ? obj : []);
+  const set = new Set();
+  for (const x of ids){
+    const rid = normalizeRoomId(x);
+    if (rid) set.add(rid);
+  }
+  return set;
+}
+
+function saveQuarantineSet(){
+  try{
+    const payload = { updatedAt: now(), roomIds: Array.from(quarantineSet) };
+    atomicWriteFile(QUARANTINE_FILE, JSON.stringify(payload));
+  }catch(e){}
+}
+
+quarantineSet = loadQuarantineSet();
+
+function isLocalAddress(addr){
+  const a = String(addr || "");
+  return a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1";
+}
+
+function isAdminAuthorized(req, urlObj){
+  if (ADMIN_KEY){
+    const qk = String(urlObj?.searchParams?.get("key") || "");
+    const hk = String(req.headers["x-admin-key"] || "");
+    return (qk && qk === ADMIN_KEY) || (hk && hk === ADMIN_KEY);
+  }
+  return isLocalAddress(req.socket.remoteAddress);
+}
+
+function sendJson(res, code, obj){
+  res.writeHead(code, { "content-type":"application/json; charset=utf-8" });
+  res.end(JSON.stringify(obj));
+}
+
+// --- Step4: minimal rate limiting ---
+function checkRateLimit(ip, op){
+  const cfg = RATE_BY_OP[op] || RATE_DEFAULT;
+  const t = now();
+  const key = String(ip || "unknown") + "|" + String(op || "unknown");
+  let e = RATE_BUCKETS.get(key);
+  if (!e || !Number.isFinite(e.resetAt) || e.resetAt <= t){
+    e = { count: 0, resetAt: t + cfg.windowMs };
+  }
+  e.count += 1;
+  RATE_BUCKETS.set(key, e);
+  if (e.count > cfg.max){
+    return { ok:false, retryAfterMs: Math.max(0, e.resetAt - t) };
+  }
+  return { ok:true, retryAfterMs: 0 };
+}
+
+setInterval(() => {
+  const t = now();
+  for (const [k,e] of RATE_BUCKETS.entries()){
+    if (!e || !Number.isFinite(e.resetAt) || e.resetAt <= t) RATE_BUCKETS.delete(k);
+  }
+}, 30_000);
 
 function loadIndex(){
   const obj = safeReadJson(INDEX_FILE);
@@ -424,6 +508,7 @@ function findRandomOpenRoomId(){
   for (const rid in index){
     const meta = index[rid];
     if (!meta) continue;
+    if (quarantineSet.has(rid)) continue;
     if (meta.completed) continue;
     if ((meta.filledCount || 0) >= 60) continue;
     candidates.push(rid);
@@ -488,6 +573,8 @@ const server = http.createServer((req, res) => {
       roomsOnDisk,
       cachedRooms: cache.size,
       backups,
+      quarantineCount: quarantineSet.size,
+      dirtyRooms: dirtyRoomIds.size,
       dataDir: DATA_DIR,
       counters: METRICS.counters,
       lastError: LAST_ERROR,
@@ -530,6 +617,8 @@ const server = http.createServer((req, res) => {
       ["部屋数(ディスク)", String(s.roomsOnDisk)],
       ["キャッシュ中の部屋数", String(s.cachedRooms)],
       ["バックアップ数", String(s.backups)],
+      ["隔離数", String(s.quarantineCount || 0)],
+      ["dirty数", String(s.dirtyRooms || 0)],
       ["保存先(DATA_DIR)", String(s.dataDir)],
       ["直近エラー時刻", fmtIso(le.ts)],
       ["直近エラーコード", le.code ? String(le.code) : "なし"],
@@ -595,6 +684,62 @@ const server = http.createServer((req, res) => {
 </html>`;
   }
 
+  // --- Step4: minimal admin endpoints ---
+  if (pathname === "/admin/status"){
+    if (!isAdminAuthorized(req, u)){
+      res.writeHead(404); res.end("not found");
+      return;
+    }
+    const snap = healthSnapshot();
+    // add a little more operational info than /health
+    const out = {
+      ok: true,
+      ts: snap.ts,
+      uptimeSec: snap.uptimeSec,
+      wsClients: snap.wsClients,
+      roomsInIndex: snap.roomsInIndex,
+      roomsOnDisk: snap.roomsOnDisk,
+      cachedRooms: snap.cachedRooms,
+      backups: snap.backups,
+      dirtyRooms: snap.dirtyRooms,
+      quarantineCount: snap.quarantineCount,
+      dataDir: snap.dataDir,
+      lastError: snap.lastError,
+      memory: process.memoryUsage(),
+      env: {
+        ROOM_CACHE_MAX,
+        ROOM_CACHE_IDLE_MS,
+        BACKUP_INTERVAL_MS,
+        BACKUP_KEEP,
+      }
+    };
+    sendJson(res, 200, out);
+    return;
+  }
+
+  if (pathname === "/admin/quarantine"){
+    if (!isAdminAuthorized(req, u)){
+      res.writeHead(404); res.end("not found");
+      return;
+    }
+    const roomId = normalizeRoomId(u.searchParams.get("roomId"));
+    const mode = String(u.searchParams.get("mode") || "toggle").toLowerCase();
+    if (!roomId){
+      sendJson(res, 400, { ok:false, code:"INVALID_ROOM_ID", message:"roomId が不正です" });
+      return;
+    }
+    let quarantined = quarantineSet.has(roomId);
+    if (mode === "on") quarantined = true;
+    else if (mode === "off") quarantined = false;
+    else quarantined = !quarantined; // toggle / unknown -> toggle
+    if (quarantined) quarantineSet.add(roomId);
+    else quarantineSet.delete(roomId);
+    saveQuarantineSet();
+    logLine('info','admin_quarantine', { roomId, quarantined, remote: req.socket.remoteAddress || "" });
+    sendJson(res, 200, { ok:true, roomId, quarantined, quarantineCount: quarantineSet.size });
+    return;
+  }
+
   if (pathname === "/health" || pathname === "/healthz" || pathname === "/health-ja" || pathname === "/health_ja"){
     const format = String(u.searchParams.get("format") || u.searchParams.get("view") || "").toLowerCase();
     const wantsJson = (format === "json");
@@ -627,6 +772,14 @@ const server = http.createServer((req, res) => {
     lines.push('# HELP anim5s_rooms_in_index Rooms in index');
     lines.push('# TYPE anim5s_rooms_in_index gauge');
     lines.push('anim5s_rooms_in_index ' + Object.keys(index).length);
+
+    lines.push('# HELP anim5s_quarantine_count Quarantined rooms count');
+    lines.push('# TYPE anim5s_quarantine_count gauge');
+    lines.push('anim5s_quarantine_count ' + quarantineSet.size);
+
+    lines.push('# HELP anim5s_dirty_rooms Dirty rooms count (pending backup)');
+    lines.push('# TYPE anim5s_dirty_rooms gauge');
+    lines.push('anim5s_dirty_rooms ' + dirtyRoomIds.size);
 
     let roomsOnDisk = 0;
     try{ roomsOnDisk = fs.readdirSync(ROOMS_DIR).filter(f=>f.endsWith(".json")).length; }catch(e){}
@@ -710,6 +863,15 @@ wss.on("connection", (ws) => {
     inc('ws_msg_type_' + opName);
     const d = m.data || {};
 
+    // Step4: minimal rate limiting
+    const ip = (ws._socket && ws._socket.remoteAddress) ? ws._socket.remoteAddress : "unknown";
+    const rl = checkRateLimit(ip, t || "unknown");
+    if (!rl.ok){
+      inc('rate_limited_total');
+      send(ws, { v:1, t:"error", ts: now(), data:{ code:"RATE_LIMIT", message:"操作が早すぎます。少し待ってね", retryAfterMs: rl.retryAfterMs } });
+      return;
+    }
+
 
     // Backward-compatible handshake (older clients send these)
     if (t === "hello"){
@@ -720,6 +882,10 @@ wss.on("connection", (ws) => {
     if (t === "resync"){
       const roomId = normalizeRoomId(d.roomId || ws._roomId);
       if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
+      if (quarantineSet.has(roomId)){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
+        return;
+      }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
@@ -800,6 +966,10 @@ wss.on("connection", (ws) => {
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } });
         return;
       }
+      if (quarantineSet.has(roomId)){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
+        return;
+      }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
@@ -840,6 +1010,10 @@ wss.on("connection", (ws) => {
     if (t === "join_room"){
       const roomId = normalizeRoomId(d.roomId || ws._roomId);
       if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
+      if (quarantineSet.has(roomId)){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
+        return;
+      }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
@@ -882,6 +1056,10 @@ wss.on("connection", (ws) => {
     if (t === "get_frame"){
       const roomId = normalizeRoomId(d.roomId || ws._roomId);
       if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
+      if (quarantineSet.has(roomId)){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
+        return;
+      }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
@@ -900,6 +1078,10 @@ wss.on("connection", (ws) => {
     if (t === "submit_frame"){
       const roomId = normalizeRoomId(d.roomId || ws._roomId);
       if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
+      if (quarantineSet.has(roomId)){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
+        return;
+      }
       const room = getRoom(roomId);
       if (!room){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });

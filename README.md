@@ -1,4 +1,4 @@
-# みんあ (anim5s) — V43
+# みんあ (anim5s) — V45
 
 ## 現在の確定仕様（Phase3 最終）
 部屋は3つ：
@@ -37,7 +37,7 @@
 `client/ws-test.html` を開いて OPEN/RECV が出るか確認。
 
 
-## Phase4 Step2（永続化＋メモリ肥大対策）を反映した内容（V43）
+## Phase4 Step2（永続化＋メモリ肥大対策）を反映した内容（V44）
 - サーバ側の永続化を「原子的書き込み（temp→rename）」にして、クラッシュ時のJSON破損リスクを低減
 - rooms_index.json が欠損/破損しても、rooms/ を走査して自動でインデックスを再構築
 - 変更があった部屋だけを対象に、一定間隔で backups/ に増分バックアップ（回転保持）
@@ -52,6 +52,23 @@
 ## 監視（Step3）
 - サーバログ：ホスティング（Render等）の Logs で確認
 - ヘルス：`/health`（または `/healthz`）
+  - ブラウザで開くと日本語HTML表示（/health?format=html や /health-ja）。JSONが必要なら /health?format=json
 - メトリクス：`/metrics`（Prometheus 形式のテキスト）
 
 外形監視（UptimeRobot等）は `/health` を1分おきに叩くのが簡単です。
+
+
+## 運用ツール最小（Step4）を反映した内容（V45）
+- `/admin/status` : 管理者用JSONステータス（稼働時間、WS接続、部屋数、キャッシュ、バックアップ、dirty数、隔離数、直近エラー等）
+- `/admin/quarantine` : roomId単位で隔離ON/OFF/切替（隔離した部屋は「存在しない」扱い）
+  - 例：`/admin/quarantine?roomId=XXXXXX&mode=toggle`
+
+認証：
+- 環境変数 `ADMIN_KEY` がある場合：`?key=...` またはヘッダ `x-admin-key: ...`
+- `ADMIN_KEY` 未設定の場合：localhost からのみアクセス可能（外部は 404）
+
+レート制限（最小）：
+- IP単位・操作種別ごとに簡易制限。超過時はWSの `error` で `code="RATE_LIMIT"` と `retryAfterMs` を返します。
+
+クライアント：
+- 「自分の作品」で削除ボタン（確認付き）を追加。

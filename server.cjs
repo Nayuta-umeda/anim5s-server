@@ -45,6 +45,11 @@ const ROOM_CACHE_IDLE_MS = Number(process.env.ROOM_CACHE_IDLE_MS || 5 * 60 * 100
 // Reservation
 const RESERVATION_MS = Number(process.env.RESERVATION_MS || 3 * 60 * 1000);
 
+// --- Animation constants (V51 / spec change) ---
+// 5 seconds animation: 6 fps => 30 frames
+const FRAME_COUNT = 30;
+const FPS = 6;
+
 // --- Step4: minimal ops tooling ---
 // Quarantine list (rooms treated as "not found")
 const QUARANTINE_FILE = path.join(DATA_DIR, "quarantine.json");
@@ -62,6 +67,9 @@ const RATE_BY_OP = {
   join_by_id: { windowMs: 10_000, max: 18 },
   create_public_and_submit: { windowMs: 60_000, max: 12 },
   submit_frame: { windowMs: 60_000, max: 10 },
+  // V50: public completed list + GIF save count
+  list_public_completed: { windowMs: 10_000, max: 20 },
+  gif_saved: { windowMs: 10_000, max: 30 },
 };
 
 const THEME_POOL = [
@@ -206,6 +214,39 @@ function loadIndex(){
 }
 let index = loadIndex();
 
+function normalizeIndexMeta(meta){
+  const m = (meta && typeof meta === "object") ? meta : {};
+  const roomId = normalizeRoomId(m.roomId);
+  if (!roomId) return null;
+  const createdAt = Number(m.createdAt || 0) || 0;
+  const updatedAt = Number(m.updatedAt || 0) || 0;
+  const filledCount = Math.max(0, Math.min(FRAME_COUNT, Number(m.filledCount || 0) || 0));
+  const completed = Boolean(m.completed);
+  const gifSaves = Math.max(0, Number(m.gifSaves || 0) || 0);
+  // completedAt may be missing in older data; fall back to updatedAt.
+  const completedAt = completed ? (Number(m.completedAt || 0) || updatedAt || 0) : (Number(m.completedAt || 0) || 0);
+  return {
+    roomId,
+    theme: (m.theme && String(m.theme).trim()) ? String(m.theme).trim() : "",
+    createdAt,
+    updatedAt,
+    filledCount,
+    completed,
+    gifSaves,
+    completedAt,
+  };
+}
+
+// sanitize loaded index (older versions may miss fields)
+try{
+  const out = {};
+  for (const rid in index){
+    const nm = normalizeIndexMeta(index[rid]);
+    if (nm) out[nm.roomId] = nm;
+  }
+  index = out;
+}catch(_e){}
+
 function rebuildIndexFromDisk(){
   const out = {};
   let files = [];
@@ -224,12 +265,16 @@ function rebuildIndexFromDisk(){
     const createdAt = Number(obj.createdAt || 0) || 0;
     const updatedAt = Number(obj.updatedAt || 0) || 0;
 
-    const committedArr = Array.isArray(obj.committed) ? obj.committed.map(Boolean)
-                      : (Array.isArray(obj.filled) ? obj.filled.map(Boolean) : []);
+    // V51: index is based on the first 30 frames only
+    const committedArr = (Array.isArray(obj.committed) ? obj.committed : (Array.isArray(obj.filled) ? obj.filled : []))
+      .slice(0, FRAME_COUNT)
+      .map(Boolean);
     const filledCount = committedArr.reduce((a,b)=>a+(b?1:0), 0);
-    const completed = (String(obj.phase || "") === "PLAYBACK") || filledCount >= 60;
+    const completed = (String(obj.phase || "") === "PLAYBACK") || filledCount >= FRAME_COUNT;
+    const gifSaves = Math.max(0, Number(obj.gifSaves || 0) || 0);
+    const completedAt = completed ? (Number(obj.completedAt || 0) || updatedAt || 0) : (Number(obj.completedAt || 0) || 0);
 
-    out[rid] = { roomId: rid, theme, createdAt, updatedAt, filledCount, completed };
+    out[rid] = { roomId: rid, theme, createdAt, updatedAt, filledCount, completed, gifSaves, completedAt };
   }
   return out;
 }
@@ -261,7 +306,7 @@ function cleanupReservations(room){
     const fi = (r && Number.isFinite(r.frameIndex)) ? r.frameIndex : -1;
     const ex = r ? (Number(r.expiresAt) || 0) : 0;
     const expired = (!r) || (ex <= t);
-    const invalid = !(fi >= 0 && fi < 60);
+    const invalid = !(fi >= 0 && fi < FRAME_COUNT);
     const committed = (!invalid) ? Boolean(room.committed[fi]) : false;
     if (expired || committed || invalid){
       room.reservations.delete(tok);
@@ -277,7 +322,15 @@ function cleanupReservations(room){
 function normalizePhase(room){
   const done = room.committed.every(Boolean);
   if (done){
-    room.phase = "PLAYBACK";
+    // When a room becomes fully completed, remember the completion timestamp.
+    // (Older rooms may lack completedAt; in that case, fall back later.)
+    if (room.phase !== "PLAYBACK"){
+      room.phase = "PLAYBACK";
+      if (!room.completedAt) room.completedAt = now();
+    }else{
+      room.phase = "PLAYBACK";
+      if (!room.completedAt) room.completedAt = (Number(room.updatedAt || 0) || now());
+    }
   }else{
     room.phase = "DRAWING";
   }
@@ -286,10 +339,11 @@ function normalizePhase(room){
 function deserializeRoom(obj){
   const roomId = normalizeRoomId(obj?.roomId);
   if (!roomId) return null;
-  const frames = Array.isArray(obj?.frames) ? obj.frames.slice(0,60) : [];
-  const committed = Array.isArray(obj?.committed) ? obj.committed.slice(0,60).map(Boolean) : [];
-  while (frames.length < 60) frames.push(null);
-  while (committed.length < 60) committed.push(false);
+  // V51: globally switch to 30 frames (6fps). Older data (60 frames) is truncated.
+  const frames = Array.isArray(obj?.frames) ? obj.frames.slice(0, FRAME_COUNT) : [];
+  const committed = Array.isArray(obj?.committed) ? obj.committed.slice(0, FRAME_COUNT).map(Boolean) : [];
+  while (frames.length < FRAME_COUNT) frames.push(null);
+  while (committed.length < FRAME_COUNT) committed.push(false);
 
   const room = {
     roomId,
@@ -298,6 +352,8 @@ function deserializeRoom(obj){
     committed,
     createdAt: Number(obj?.createdAt || 0) || now(),
     updatedAt: Number(obj?.updatedAt || 0) || now(),
+    gifSaves: Math.max(0, Number(obj?.gifSaves || 0) || 0),
+    completedAt: Number(obj?.completedAt || 0) || 0,
     phase: String(obj?.phase || "DRAWING"),
     reservations: new Map(),
     reservedByFrame: new Map(),
@@ -312,7 +368,7 @@ function deserializeRoom(obj){
       const fi = Number(r.frameIndex);
       const ex = Number(r.expiresAt);
       if (!tok) continue;
-      if (!Number.isFinite(fi) || fi < 0 || fi >= 60) continue;
+      if (!Number.isFinite(fi) || fi < 0 || fi >= FRAME_COUNT) continue;
       if (!Number.isFinite(ex) || ex <= 0) continue;
       room.reservations.set(tok, { frameIndex: fi, expiresAt: ex });
     }
@@ -339,6 +395,8 @@ function serializeRoom(room){
     committed: room.committed,
     createdAt: room.createdAt,
     updatedAt: room.updatedAt,
+    gifSaves: Math.max(0, Number(room.gifSaves || 0) || 0),
+    completedAt: Number(room.completedAt || 0) || 0,
     phase: room.phase,
     reservations: Array.from(room.reservations.entries()),
   };
@@ -353,6 +411,8 @@ function updateIndexFromRoom(room){
     updatedAt: room.updatedAt,
     filledCount,
     completed: room.phase === "PLAYBACK",
+    gifSaves: Math.max(0, Number(room.gifSaves || 0) || 0),
+    completedAt: (room.phase === "PLAYBACK") ? (Number(room.completedAt || 0) || room.updatedAt || 0) : (Number(room.completedAt || 0) || 0),
   };
 }
 
@@ -462,10 +522,12 @@ function makeRoom(theme){
   const room = {
     roomId,
     theme: ((theme && String(theme).trim()) ? String(theme).trim() : randTheme()),
-    frames: Array.from({length:60}, ()=>null),
-    committed: Array.from({length:60}, ()=>false),
+    frames: Array.from({length:FRAME_COUNT}, ()=>null),
+    committed: Array.from({length:FRAME_COUNT}, ()=>false),
     createdAt: now(),
     updatedAt: now(),
+    gifSaves: 0,
+    completedAt: 0,
     phase: "DRAWING",
     reservations: new Map(),
     reservedByFrame: new Map(),
@@ -482,19 +544,21 @@ function roomState(room){
   return {
     roomId: room.roomId,
     theme: room.theme,
-    frameCount: 60,
-    fps: 12,
+    frameCount: FRAME_COUNT,
+    fps: FPS,
     phase: room.phase,
     createdAt: room.createdAt,
     updatedAt: room.updatedAt,
-    filled: room.committed.slice(),
+    gifSaves: Math.max(0, Number(room.gifSaves || 0) || 0),
+    completedAt: Number(room.completedAt || 0) || 0,
+    filled: room.committed.slice(0, FRAME_COUNT),
     completed: room.phase === "PLAYBACK",
   };
 }
 
 function firstYoungestEmpty(room){
   cleanupReservations(room);
-  for (let i=0;i<60;i++){
+  for (let i=0;i<FRAME_COUNT;i++){
     if (room.committed[i]) continue;
     if (room.reservedByFrame.has(i)) continue;
     return i;
@@ -510,7 +574,7 @@ function findRandomOpenRoomId(){
     if (!meta) continue;
     if (quarantineSet.has(rid)) continue;
     if (meta.completed) continue;
-    if ((meta.filledCount || 0) >= 60) continue;
+    if ((meta.filledCount || 0) >= FRAME_COUNT) continue;
     candidates.push(rid);
   }
   if (!candidates.length) return null;
@@ -896,6 +960,75 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // V50: list completed public rooms for "みんなの作品"
+    if (t === "list_public_completed"){
+      const sort = (String(d.sort || "new") === "rank") ? "rank" : "new";
+      let limit = Number(d.limit || 60);
+      if (!Number.isFinite(limit)) limit = 60;
+      limit = Math.max(1, Math.min(200, Math.floor(limit)));
+
+      const items = [];
+      for (const rid in index){
+        const meta = normalizeIndexMeta(index[rid]);
+        if (!meta) continue;
+        if (quarantineSet.has(meta.roomId)) continue;
+        if (!meta.completed) continue;
+        items.push({
+          roomId: meta.roomId,
+          theme: meta.theme,
+          createdAt: meta.createdAt,
+          updatedAt: meta.updatedAt,
+          completedAt: meta.completedAt,
+          gifSaves: meta.gifSaves,
+        });
+      }
+
+      if (sort === "rank"){
+        items.sort((a,b) => {
+          const ds = (b.gifSaves||0) - (a.gifSaves||0);
+          if (ds) return ds;
+          const bt = (b.completedAt||b.updatedAt||0) - (a.completedAt||a.updatedAt||0);
+          if (bt) return bt;
+          return String(a.roomId).localeCompare(String(b.roomId));
+        });
+      }else{
+        items.sort((a,b) => {
+          const bt = (b.completedAt||b.updatedAt||0) - (a.completedAt||a.updatedAt||0);
+          if (bt) return bt;
+          return String(a.roomId).localeCompare(String(b.roomId));
+        });
+      }
+
+      send(ws, { v:1, t:"public_completed_list", ts: now(), data:{ sort, items: items.slice(0, limit) } });
+      return;
+    }
+
+    // V50: count "GIFで保存" for ranking
+    if (t === "gif_saved"){
+      const roomId = normalizeRoomId(d.roomId || ws._roomId);
+      if (!roomId){ send(ws, { v:1, t:"error", ts: now(), data:{ message:"roomId が不正です" } }); return; }
+      if (quarantineSet.has(roomId)){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
+        return;
+      }
+      const room = getRoom(roomId);
+      if (!room){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"部屋が見つからない" } });
+        return;
+      }
+      normalizePhase(room);
+      if (room.phase !== "PLAYBACK"){
+        send(ws, { v:1, t:"error", ts: now(), data:{ message:"完成済みの作品だけカウントできます" } });
+        return;
+      }
+      room.gifSaves = Math.max(0, Number(room.gifSaves || 0) || 0) + 1;
+      room.updatedAt = now();
+      saveRoom(room);
+      inc('gif_saved_total');
+      send(ws, { v:1, t:"gif_saved_ack", ts: now(), data:{ roomId: room.roomId, gifSaves: room.gifSaves } });
+      return;
+    }
+
     if (t === "create_public_and_submit"){
       const theme = (d.theme && String(d.theme).trim()) ? String(d.theme).trim() : randTheme();
       const dataUrl = d.dataUrl;
@@ -1066,7 +1199,7 @@ wss.on("connection", (ws) => {
         return;
       }
       const idx = Number(d.frameIndex);
-      if (!Number.isFinite(idx) || idx < 0 || idx >= 60){
+      if (!Number.isFinite(idx) || idx < 0 || idx >= FRAME_COUNT){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"frameIndex が不正" } });
         return;
       }
@@ -1099,7 +1232,7 @@ wss.on("connection", (ws) => {
       const tok = String(d.reservationToken || "");
       const dataUrl = d.dataUrl;
 
-      if (!Number.isFinite(idx) || idx<0 || idx>=60){
+      if (!Number.isFinite(idx) || idx<0 || idx>=FRAME_COUNT){
         send(ws, { v:1, t:"error", ts: now(), data:{ message:"frameIndex が不正" } });
         return;
       }
